@@ -18,5 +18,6 @@ int main(string[] args)
 		"tests.sctp.timer_test",
 		"tests.datachannel.message_test",
 		"tests.sctp.association_test",
+		"tests.datachannel.channel_test",
 	);
 }
