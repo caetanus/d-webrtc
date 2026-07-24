@@ -21,5 +21,6 @@ int main(string[] args)
 		"tests.datachannel.channel_test",
 		"tests.ice.candidate_test",
 		"tests.ice.attributes_test",
+		"tests.ice.agent_test",
 	);
 }
