@@ -146,3 +146,32 @@ unittest
 	(cast(string) atServer.get.data).should.equal("ping");
 	(cast(string) atClient.get.data).should.equal("pong");
 }
+
+@("SCTP retransmits a dropped DATA chunk after the T3-rtx timeout")
+unittest
+{
+	Association client, server;
+	connect(client, server);
+
+	client.send(0, PPID_STRING, cast(ubyte[]) "recover me".dup, true);
+
+	// Drop the first transmission entirely: drain it but never deliver it. The
+	// chunk is now in-flight and unacked, with the T3-rtx timer armed at t=0.
+	auto dropped = client.gatherOutbound(0);
+	(dropped.length > 0).should.equal(true); // there WAS a DATA packet to lose
+
+	// Time advances past the RTO (default 3000ms); the timeout fires.
+	enum long t = 4000;
+	client.handleTimeout(t);
+
+	// The retransmission now flows, the server delivers it, and its SACK settles
+	// the in-flight window.
+	foreach (pkt; client.gatherOutbound(t))
+		server.handleInbound(pkt, t);
+	foreach (pkt; server.gatherOutbound(t))
+		client.handleInbound(pkt, t);
+
+	auto msg = server.receive();
+	msg.isNull.should.equal(false);
+	(cast(string) msg.get.data).should.equal("recover me");
+}

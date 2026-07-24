@@ -138,6 +138,16 @@ final class DtlsTransport
 		BIO_write(rbio, datagram.ptr, cast(int) datagram.length);
 	}
 
+	/// Retransmit the last handshake flight if OpenSSL's DTLS timer has expired.
+	/// A no-op once connected or when no timeout is pending; the freshly queued
+	/// ciphertext is drained by the next `gatherOutbound`. (OpenSSL uses its own
+	/// wall clock here, not the caller's `now`.)
+	void handleTimeout() @trusted
+	{
+		if (!established_)
+			DTLSv1_handle_timeout(ssl);
+	}
+
 	/// Advance the handshake. Safe to call repeatedly; it becomes a no-op once
 	/// connected. Throws on a real (non-want-read/write) error.
 	void handshake() @trusted

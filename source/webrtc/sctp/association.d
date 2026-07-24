@@ -106,6 +106,7 @@ final class Association
 	private uint partialBytesAcked; // congestion-avoidance accounting
 	private uint minTsn2measureRtt; // Karn's algorithm: lowest TSN eligible for RTT
 	private bool ackImmediate; // a SACK is owed on the next gatherOutbound
+	private bool t3RetransmitPending; // in-flight chunks flagged for T3-rtx resend
 	private InboundMessage[] inbound; // reassembled messages awaiting receive()
 
 	RtoManager rtoMgr;
@@ -175,10 +176,33 @@ final class Association
 
 		if (state_ == AssociationState.established)
 		{
+			gatherRetransmit(outs);
 			gatherOutboundData(outs, now);
 			gatherOutboundSack(outs);
 		}
 		return outs;
+	}
+
+	/// Drive time-based retransmission. The caller invokes this with the current
+	/// time (ms) before draining `gatherOutbound`; if the T3-rtx timer has
+	/// expired it collapses the congestion window and flags the in-flight chunks
+	/// for retransmission (RFC 4960 §6.3.3 / §7.2.3).
+	void handleTimeout(long now)
+	{
+		if (state_ != AssociationState.established)
+			return;
+		auto ex = timers.isExpired(Timer.t3RTX, now);
+		if (!ex[0])
+			return;
+		// §7.2.3: ssthresh = max(cwnd/2, 4·MTU); cwnd = 1·MTU (slow-start restart).
+		immutable half = cwnd / 2;
+		immutable floor = 4 * mtu;
+		ssthresh = half > floor ? half : floor;
+		cwnd = mtu;
+		inflightQueue.markAllToRetransmit();
+		t3RetransmitPending = true;
+		// §6.3.3 E2: restart T3-rtx with the (backed-off) RTO.
+		timers.start(Timer.t3RTX, now, rtoMgr.getRto());
 	}
 
 	/// Queue a user message on `streamId` for sending. `ppid` is the payload
@@ -454,8 +478,60 @@ final class Association
 			return;
 
 		timers.restartIfStale(Timer.t3RTX, now, rtoMgr.getRto());
+		bundleData(chunks, outs);
+	}
 
-		// Bundle DATA chunks into packets bounded by the path MTU.
+	// T3-rtx retransmission (RFC 4960 §6.3.3): after a timeout marked the
+	// in-flight chunks, resend the lowest-TSN flagged ones that fit the send
+	// window, clearing each flag so it is not resent before the next timeout.
+	private void gatherRetransmit(ref ubyte[][] outs)
+	{
+		if (!t3RetransmitPending)
+			return;
+		immutable awnd = cwnd < rwnd ? cwnd : rwnd;
+		DataChunk[] chunks;
+		size_t bytesToSend;
+		bool chunksRemaining;
+		uint i;
+		for (;;)
+		{
+			immutable tsn = cumulativeTsnAckPoint + i + 1;
+			auto c = inflightQueue.get(tsn);
+			if (c is null)
+				break; // end of in-flight window
+			if (!c.retransmit)
+			{
+				i++;
+				continue;
+			}
+			immutable len = c.data.userData.length;
+			bool done;
+			if (i == 0 && rwnd < len)
+			{
+				done = true; // send it as a zero-window probe, then stop
+				chunksRemaining = true;
+			}
+			else if (bytesToSend + len > awnd)
+			{
+				chunksRemaining = true;
+				break;
+			}
+			c.retransmit = false;
+			c.nSent += 1;
+			bytesToSend += len;
+			chunks ~= c.data;
+			if (done)
+				break;
+			i++;
+		}
+		t3RetransmitPending = chunksRemaining;
+		if (chunks.length)
+			bundleData(chunks, outs);
+	}
+
+	// Bundle DATA chunks into packets bounded by the path MTU.
+	private void bundleData(DataChunk[] chunks, ref ubyte[][] outs)
+	{
 		DataChunk[] bundle;
 		uint bundleBytes = 12; // common header
 		foreach (ref dc; chunks)

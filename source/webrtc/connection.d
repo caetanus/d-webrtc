@@ -137,6 +137,17 @@ final class PeerConnection
 		pumpDtlsInbound(now);
 	}
 
+	/// Drive time-based retransmission across the layers. The driver calls this
+	/// with the current time (ms) before `gatherOutbound`, so a lost DTLS
+	/// handshake flight or a lost SCTP DATA chunk is resent rather than stalling.
+	void handleTimeout(long now)
+	{
+		if (dtlsStarted && !dtls.isConnected)
+			dtls.handleTimeout();
+		if (sctpStarted)
+			sctp.handleTimeout(now);
+	}
+
 	/// Drive every layer and drain the datagrams to put on the wire.
 	Datagram[] gatherOutbound(long now)
 	{
