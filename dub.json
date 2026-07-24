@@ -7,9 +7,10 @@
 	"sourcePaths": ["source"],
 	"importPaths": ["source"],
 	"dependencies": {
-		"libsodiumd": "~>0.2"
+		"libsodiumd": "~>0.2",
+		"openssl": "~>3.4"
 	},
-	"libs": ["crypto"],
+	"libs": ["crypto", "ssl"],
 	"configurations": [
 		{
 			"name": "library",
