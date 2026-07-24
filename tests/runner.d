@@ -10,5 +10,6 @@ int main(string[] args)
 		"tests.util.hmac_test",
 		"tests.sctp.crc32c_test",
 		"tests.sctp.packet_test",
+		"tests.sctp.chunk_test",
 	);
 }
