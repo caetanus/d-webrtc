@@ -25,6 +25,7 @@ struct PayloadData
 	bool abandoned;
 	uint nSent;
 	uint missIndicator;
+	long since = -1; // send time (ms) of the first transmission, for RTT; -1 = unset
 
 	uint tsn() const @safe pure nothrow @nogc
 	{
@@ -66,6 +67,15 @@ struct PayloadQueue
 		insertSorted(p.tsn);
 		chunkMap[p.tsn] = p;
 		return true;
+	}
+
+	/// Push a chunk unconditionally (used for the in-flight queue, where TSNs are
+	/// freshly assigned and never duplicate or lag the cumulative point).
+	void pushNoCheck(PayloadData p) @safe pure nothrow
+	{
+		nBytes += p.data.userData.length;
+		insertSorted(p.tsn);
+		chunkMap[p.tsn] = p;
 	}
 
 	/// Pop only if the oldest queued TSN equals `tsn`.
