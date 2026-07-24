@@ -24,5 +24,6 @@ int main(string[] args)
 		"tests.ice.agent_test",
 		"tests.dtls.certificate_test",
 		"tests.dtls.transport_test",
+		"tests.connection_test",
 	);
 }
