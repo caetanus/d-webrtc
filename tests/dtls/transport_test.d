@@ -79,3 +79,39 @@ unittest
 	(cast(string) server.receive()).should.equal("ping over dtls");
 	(cast(string) client.receive()).should.equal("pong over dtls");
 }
+
+@("DTLS handshake datagrams stay within the link MTU")
+unittest
+{
+	// With the link MTU pinned, OpenSSL fragments handshake records and
+	// gatherOutbound packs them into datagrams no larger than the MTU — so a
+	// flight never becomes one oversized datagram a real network would drop.
+	auto client = new DtlsTransport(DtlsRole.client, Certificate.generate());
+	auto server = new DtlsTransport(DtlsRole.server, Certificate.generate());
+
+	size_t maxDatagram;
+	foreach (_; 0 .. 40)
+	{
+		client.handshake();
+		server.handshake();
+		foreach (d; client.gatherOutbound())
+		{
+			if (d.length > maxDatagram)
+				maxDatagram = d.length;
+			server.feed(d);
+		}
+		foreach (d; server.gatherOutbound())
+		{
+			if (d.length > maxDatagram)
+				maxDatagram = d.length;
+			client.feed(d);
+		}
+		if (client.isConnected && server.isConnected)
+			break;
+	}
+
+	client.isConnected.should.equal(true);
+	server.isConnected.should.equal(true);
+	(maxDatagram > 0).should.equal(true);
+	(maxDatagram <= 1200).should.equal(true); // never exceeds the pinned link MTU
+}

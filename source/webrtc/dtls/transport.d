@@ -31,11 +31,44 @@ import webrtc.dtls.certificate : Certificate;
 // same way the SCTP layer declares the HMAC symbols the binding is missing.
 private extern (C) const(SSL_METHOD)* DTLS_method();
 
+// The link MTU pinned on the DTLS session (a conservative value that fits a
+// 1500-byte Ethernet path with room for IP/UDP headers). OpenSSL fragments
+// handshake records to this, and gatherOutbound packs records into datagrams
+// no larger than it.
+private enum int DTLS_MTU = 1200;
+
 /// Which side of the DTLS handshake this endpoint plays.
 enum DtlsRole
 {
 	client,
 	server,
+}
+
+// Split a write-BIO blob (a run of DTLS records) into datagrams of at most
+// DTLS_MTU bytes, appending each to `outs`. A DTLS record header is 13 bytes
+// with the fragment length as a big-endian u16 at offset 11. Unparseable tail
+// bytes are emitted as-is (best effort — should not happen with a mem BIO).
+private void packRecords(scope const(ubyte)[] blob, ref ubyte[][] outs) @safe pure nothrow
+{
+	size_t i;
+	ubyte[] cur;
+	while (i + 13 <= blob.length)
+	{
+		immutable recLen = 13 + ((blob[i + 11] << 8) | blob[i + 12]);
+		if (i + recLen > blob.length)
+			break; // truncated record — bail to the tail handler below
+		if (cur.length && cur.length + recLen > DTLS_MTU)
+		{
+			outs ~= cur;
+			cur = [];
+		}
+		cur ~= blob[i .. i + recLen];
+		i += recLen;
+	}
+	if (cur.length)
+		outs ~= cur;
+	if (i < blob.length)
+		outs ~= blob[i .. $].dup; // leftover we could not frame
 }
 
 /// A single DTLS connection, driven sans-io over memory BIOs.
@@ -63,6 +96,11 @@ final class DtlsTransport
 		// accept any chain and let the caller compare peerFingerprint().
 		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, &acceptAnyCert);
 
+		// A memory BIO cannot report a path MTU, so pin one: OpenSSL then fragments
+		// the DTLS handshake into records that fit a real UDP datagram instead of
+		// emitting oversized flights that a real network would drop.
+		SSL_CTX_set_options(ctx, SSL_OP_NO_QUERY_MTU);
+
 		ssl = SSL_new(ctx);
 		enforce(ssl !is null, "dtls: SSL_new failed");
 
@@ -75,6 +113,10 @@ final class DtlsTransport
 			SSL_set_connect_state(ssl);
 		else
 			SSL_set_accept_state(ssl);
+
+		// SSL_set_mtu(ssl, DTLS_MTU) equivalent — the deimos SSL_set_mtu template
+		// references an undefined SSL_CTRL_MTU, so call SSL_ctrl directly.
+		SSL_ctrl(ssl, SSL_CTRL_SET_MTU, DTLS_MTU, null);
 	}
 
 	~this() @trusted
@@ -135,8 +177,11 @@ final class DtlsTransport
 		return buf[0 .. n].dup;
 	}
 
-	/// Drain the ciphertext the connection wants to send. Returns each pending
-	/// write-BIO blob as one datagram (DTLS records may be coalesced).
+	/// Drain the ciphertext the connection wants to send, as UDP-datagram-sized
+	/// chunks. OpenSSL accumulates one or more DTLS records in the write BIO; we
+	/// split them at record boundaries and pack them into datagrams no larger
+	/// than the link MTU, so a handshake flight never becomes one oversized
+	/// datagram (which a real network would drop or fragment).
 	ubyte[][] gatherOutbound() @trusted
 	{
 		ubyte[][] outs;
@@ -149,7 +194,7 @@ final class DtlsTransport
 			immutable n = BIO_read(wbio, buf.ptr, cast(int) buf.length);
 			if (n <= 0)
 				break;
-			outs ~= buf[0 .. n];
+			packRecords(buf[0 .. n], outs);
 		}
 		return outs;
 	}
