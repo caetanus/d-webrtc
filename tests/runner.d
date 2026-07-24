@@ -13,5 +13,6 @@ int main(string[] args)
 		"tests.sctp.chunk_test",
 		"tests.sctp.sack_test",
 		"tests.sctp.reassembly_test",
+		"tests.sctp.payload_test",
 	);
 }
