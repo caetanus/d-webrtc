@@ -16,5 +16,6 @@ int main(string[] args)
 		"tests.sctp.payload_test",
 		"tests.sctp.pending_test",
 		"tests.sctp.timer_test",
+		"tests.datachannel.message_test",
 	);
 }
