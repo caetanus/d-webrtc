@@ -1,0 +1,31 @@
+{
+	"name": "webrtc",
+	"description": "WebRTC data-channel transport for D — laundered from webrtc-rs's sans-io 'rtc', crypto on libsodium",
+	"authors": ["caetano"],
+	"license": "MIT",
+	"targetType": "library",
+	"sourcePaths": ["source"],
+	"importPaths": ["source"],
+	"dependencies": {
+		"libsodiumd": "~>0.2"
+	},
+	"configurations": [
+		{
+			"name": "library",
+			"targetType": "library"
+		},
+		{
+			"name": "ut",
+			"targetType": "executable",
+			"targetName": "webrtc-test",
+			"mainSourceFile": "tests/runner.d",
+			"sourcePaths": ["source", "tests"],
+			"importPaths": ["source", "tests"],
+			"dependencies": {
+				"unit-threaded": "~>2.2",
+				"fluent-asserts": "~>2.0"
+			},
+			"dflags": ["-unittest"]
+		}
+	]
+}
