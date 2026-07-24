@@ -117,3 +117,45 @@ unittest
 	dialer.isConnected.should.equal(false);
 	listener.isConnected.should.equal(false);
 }
+
+@("controlled selects when USE-CANDIDATE arrives before its own check succeeds")
+unittest
+{
+	// Reproduces the async-ordering bug the in-process symmetric pump hides: the
+	// controlling peer nominates (USE-CANDIDATE) and that request reaches the
+	// controlled peer while the controlled peer's OWN connectivity check is still
+	// in flight (pair = in-progress, neither succeeded nor waiting). The pair must
+	// still be selected once that check completes.
+	auto dialer = new Agent(Role.controlling, Credentials("uAAA", "pAAAAAAAAAAAAAAAAAAA"), 1);
+	auto listener = new Agent(Role.controlled, Credentials("uBBB", "pBBBBBBBBBBBBBBBBBBB"), 2);
+
+	auto da = host("1.1.1.1", 1000);
+	auto la = host("2.2.2.2", 2000);
+	dialer.addLocalCandidate(da);
+	listener.addLocalCandidate(la);
+	dialer.setRemoteCredentials(Credentials("uBBB", "pBBBBBBBBBBBBBBBBBBB"));
+	listener.setRemoteCredentials(Credentials("uAAA", "pAAAAAAAAAAAAAAAAAAA"));
+	dialer.addRemoteCandidate(la);
+	listener.addRemoteCandidate(da);
+
+	// 1) Dialer pings; listener receives it.
+	foreach (o; dialer.gatherOutbound(0))
+		listener.handleInbound(o.data, o.src, o.dst, 0);
+	// 2) Listener responds to that ping AND emits its own ping.
+	foreach (o; listener.gatherOutbound(0))
+		dialer.handleInbound(o.data, o.src, o.dst, 0);
+	// 3) Dialer now has a succeeded pair: it responds to the listener's ping and
+	//    nominates. Deliver those to the listener in REVERSE so the USE-CANDIDATE
+	//    lands before the success to the listener's own check.
+	auto dOut = dialer.gatherOutbound(0);
+	foreach_reverse (o; dOut)
+		listener.handleInbound(o.data, o.src, o.dst, 0);
+
+	// The listener must now be selected despite the reordering.
+	listener.isConnected.should.equal(true);
+
+	// Close the loop: the listener's response to the nomination lets the dialer finish.
+	foreach (o; listener.gatherOutbound(0))
+		dialer.handleInbound(o.data, o.src, o.dst, 0);
+	dialer.isConnected.should.equal(true);
+}

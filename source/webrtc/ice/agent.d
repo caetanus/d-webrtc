@@ -313,8 +313,12 @@ final class Agent
 		immutable pi = findOrAddPair(li, ri);
 		if (role == Role.controlled && req.hasUseCandidate)
 		{
-			// RFC 8445 §7.3.1.5: nomination. If our own check already succeeded on
-			// this pair, select it; otherwise trigger a check so it can.
+			// RFC 8445 §7.3.1.5: nomination. Flag the pair as nominated regardless
+			// of its state — if our own check has already succeeded, select it now;
+			// otherwise the flag makes handleSuccessResponse select it the moment the
+			// check completes (the USE-CANDIDATE may arrive while the check is still
+			// in-flight, i.e. neither succeeded nor waiting).
+			pairs[pi].nominated = true;
 			if (pairs[pi].state == PairState.succeeded)
 			{
 				if (selected.isNull)
@@ -357,8 +361,11 @@ final class Agent
 		immutable pi = findOrAddPair(li, ri);
 		pairs[pi].state = PairState.succeeded;
 
-		if (pr.get.isUseCandidate && selected.isNull)
-			setSelected(pi); // our nomination completed (controlling side)
+		if (selected.isNull && (pr.get.isUseCandidate || pairs[pi].nominated))
+			// Select on our own completed nomination (controlling side), or on a
+			// pair the peer already flagged USE-CANDIDATE before it succeeded
+			// (controlled side — the flag was set in handleBindingRequest).
+			setSelected(pi);
 	}
 
 	// ---- helpers --------------------------------------------------------------
