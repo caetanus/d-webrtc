@@ -15,5 +15,6 @@ int main(string[] args)
 		"tests.sctp.reassembly_test",
 		"tests.sctp.payload_test",
 		"tests.sctp.pending_test",
+		"tests.sctp.timer_test",
 	);
 }
