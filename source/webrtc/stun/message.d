@@ -51,6 +51,20 @@ enum ushort ATTR_FINGERPRINT = 0x8028;
 enum ushort ATTR_ICE_CONTROLLED = 0x8029;
 enum ushort ATTR_ICE_CONTROLLING = 0x802A;
 
+/// FINGERPRINT is the CRC-32 XOR'ed with this fixed value (RFC 5389 §15.5).
+enum uint FINGERPRINT_XOR_VALUE = 0x5354_554e;
+private enum size_t FP_TLV = 8; // FINGERPRINT attribute total size: 4 header + 4 value
+
+// CRC-32/ISO-HDLC (a.k.a. the zlib/gzip CRC-32) as a big-endian-ready u32.
+// std.digest.crc.crc32Of returns the checksum little-endian.
+private uint crc32Value(scope const(ubyte)[] data) @safe
+{
+	import std.digest.crc : crc32Of;
+
+	auto d = crc32Of(data);
+	return d[0] | (cast(uint) d[1] << 8) | (cast(uint) d[2] << 16) | (cast(uint) d[3] << 24);
+}
+
 /// One STUN attribute: a type and its raw value (unpadded).
 struct Attribute
 {
@@ -82,9 +96,8 @@ struct Message
 		return false;
 	}
 
-	/// Serialize to the STUN wire format. Each attribute is padded to a 4-byte
-	/// boundary; the header length counts the padded attribute region.
-	ubyte[] encode() const @safe pure
+	/// The padded attribute region (no header).
+	private ubyte[] encodeBody() const @safe pure
 	{
 		ubyte[] body_;
 		foreach (ref a; attributes)
@@ -95,15 +108,61 @@ struct Message
 			while (body_.length % 4 != 0)
 				body_ ~= 0; // pad to 4-byte boundary
 		}
+		return body_;
+	}
 
+	/// The 20-byte header for a message whose padded body is `bodyLen` bytes.
+	private ubyte[] header(size_t bodyLen) const @safe pure
+	{
 		ubyte[] buf;
 		buf ~= [cast(ubyte)(typ >> 8), cast(ubyte)(typ & 0xff)];
-		buf ~= [cast(ubyte)(body_.length >> 8), cast(ubyte)(body_.length & 0xff)];
+		buf ~= [cast(ubyte)(bodyLen >> 8), cast(ubyte)(bodyLen & 0xff)];
 		buf ~= [cast(ubyte)(MAGIC_COOKIE >> 24), cast(ubyte)(MAGIC_COOKIE >> 16),
 			cast(ubyte)(MAGIC_COOKIE >> 8), cast(ubyte)(MAGIC_COOKIE & 0xff)];
 		buf ~= transactionId[];
-		buf ~= body_;
 		return buf;
+	}
+
+	/// Serialize to the STUN wire format. Each attribute is padded to a 4-byte
+	/// boundary; the header length counts the padded attribute region.
+	ubyte[] encode() const @safe pure
+	{
+		auto body_ = encodeBody();
+		return header(body_.length) ~ body_;
+	}
+
+	/// Append a FINGERPRINT attribute (RFC 5389 §15.5): CRC-32/ISO-HDLC of the
+	/// message up to (but excluding) FINGERPRINT — computed with the header
+	/// length already counting the FINGERPRINT TLV — XOR'ed with 0x5354554e.
+	void addFingerprint() @safe
+	{
+		auto body_ = encodeBody();
+		auto prefix = header(body_.length + FP_TLV) ~ body_;
+		immutable v = crc32Value(prefix) ^ FINGERPRINT_XOR_VALUE;
+		attributes ~= Attribute(ATTR_FINGERPRINT,
+			[cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v]);
+	}
+
+	/// Verify a trailing FINGERPRINT attribute. Returns false if it is absent,
+	/// the wrong size, or the checksum mismatches.
+	bool checkFingerprint() const @safe
+	{
+		if (attributes.length == 0)
+			return false;
+		auto last = attributes[$ - 1];
+		if (last.typ != ATTR_FINGERPRINT || last.value.length != 4)
+			return false;
+		immutable got = (cast(uint) last.value[0] << 24) | (cast(uint) last.value[1] << 16)
+			| (cast(uint) last.value[2] << 8) | last.value[3];
+		// Rebuild the message without the FINGERPRINT attribute and recompute.
+		Message m;
+		m.typ = typ;
+		m.transactionId = transactionId;
+		foreach (ref a; attributes[0 .. $ - 1])
+			m.attributes ~= Attribute(a.typ, a.value.dup);
+		auto body_ = m.encodeBody();
+		auto prefix = m.header(body_.length + FP_TLV) ~ body_;
+		return got == (crc32Value(prefix) ^ FINGERPRINT_XOR_VALUE);
 	}
 
 	/// Parse a STUN message. Throws on a malformed header or truncated attribute.

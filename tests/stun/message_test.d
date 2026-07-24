@@ -46,6 +46,27 @@ unittest
 	back.contains(ATTR_USE_CANDIDATE).should.equal(false);
 }
 
+@("stun FINGERPRINT is CRC-32/ISO-HDLC XOR 0x5354554e (rust rtc-stun vector)")
+unittest
+{
+	// Mirrors rtc-stun's fingerprint_uses_crc_32_iso_hdlc: type 0, zero txid,
+	// a SOFTWARE "software" attribute, then FINGERPRINT.
+	Message m;
+	m.attributes ~= Attribute(0x8022, cast(ubyte[]) "software".dup); // SOFTWARE
+	m.addFingerprint();
+	auto enc = m.encode;
+
+	// The FINGERPRINT value is the last 4 bytes.
+	enc[$ - 4 .. $].should.equal(cast(ubyte[])[0xe4, 0x4c, 0x33, 0xd9]);
+	// Everything up to (excluding) the FINGERPRINT TLV matches the rust raw.
+	enc[0 .. $ - 8].should.equal(cast(ubyte[])[
+		0x00, 0x00, 0x00, 0x14, 0x21, 0x12, 0xA4, 0x42,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0x80, 0x22, 0x00, 0x08, 's', 'o', 'f', 't', 'w', 'a', 'r', 'e']);
+
+	m.checkFingerprint().should.equal(true);
+}
+
 @("isStunMessage recognises the magic cookie")
 unittest
 {
