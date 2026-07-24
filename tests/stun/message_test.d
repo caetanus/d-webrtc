@@ -67,6 +67,44 @@ unittest
 	m.checkFingerprint().should.equal(true);
 }
 
+@("MESSAGE-INTEGRITY add/check round-trips and detects tampering")
+unittest
+{
+	auto key = cast(ubyte[]) "pass".dup;
+	Message m;
+	m.typ = BINDING_REQUEST;
+	m.transactionId = RFC5769_TXID;
+	m.attributes ~= Attribute(ATTR_USERNAME, cast(ubyte[]) "user".dup);
+	m.addMessageIntegrity(key);
+
+	m.checkMessageIntegrity(key).should.equal(true);
+	m.checkMessageIntegrity(cast(ubyte[]) "wrong".dup).should.equal(false);
+
+	// Survives an encode/decode round trip.
+	Message.decode(m.encode).checkMessageIntegrity(key).should.equal(true);
+
+	// Tampering with a preceding attribute breaks the HMAC.
+	auto t = Message.decode(m.encode);
+	t.attributes[0].value[0] ^= 0xff;
+	t.checkMessageIntegrity(key).should.equal(false);
+}
+
+@("MESSAGE-INTEGRITY then FINGERPRINT verify independently (FP excluded from HMAC)")
+unittest
+{
+	auto key = cast(ubyte[]) "pwd".dup;
+	Message m;
+	m.typ = BINDING_SUCCESS_RESPONSE;
+	m.transactionId = RFC5769_TXID;
+	m.attributes ~= Attribute(0x8022, cast(ubyte[]) "software".dup); // SOFTWARE
+	m.addMessageIntegrity(key); // MUST come before FINGERPRINT
+	m.addFingerprint();
+
+	auto back = Message.decode(m.encode);
+	back.checkMessageIntegrity(key).should.equal(true);
+	back.checkFingerprint().should.equal(true);
+}
+
 @("isStunMessage recognises the magic cookie")
 unittest
 {

@@ -9,6 +9,7 @@
 	"dependencies": {
 		"libsodiumd": "~>0.2"
 	},
+	"libs": ["crypto"],
 	"configurations": [
 		{
 			"name": "library",

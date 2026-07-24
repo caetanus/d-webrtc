@@ -23,6 +23,8 @@ module webrtc.stun.message;
 
 import std.exception : enforce;
 
+import webrtc.util.hmac : hmacSha1;
+
 /// Fixed value distinguishing STUN packets when multiplexed (RFC 5389 §6).
 enum uint MAGIC_COOKIE = 0x2112_A442;
 /// The 20-byte STUN message header.
@@ -54,6 +56,9 @@ enum ushort ATTR_ICE_CONTROLLING = 0x802A;
 /// FINGERPRINT is the CRC-32 XOR'ed with this fixed value (RFC 5389 §15.5).
 enum uint FINGERPRINT_XOR_VALUE = 0x5354_554e;
 private enum size_t FP_TLV = 8; // FINGERPRINT attribute total size: 4 header + 4 value
+/// MESSAGE-INTEGRITY holds a 20-byte HMAC-SHA1.
+enum size_t MESSAGE_INTEGRITY_SIZE = 20;
+private enum size_t MI_TLV = 24; // MESSAGE-INTEGRITY total size: 4 header + 20 value
 
 // CRC-32/ISO-HDLC (a.k.a. the zlib/gzip CRC-32) as a big-endian-ready u32.
 // std.digest.crc.crc32Of returns the checksum little-endian.
@@ -163,6 +168,43 @@ struct Message
 		auto body_ = m.encodeBody();
 		auto prefix = m.header(body_.length + FP_TLV) ~ body_;
 		return got == (crc32Value(prefix) ^ FINGERPRINT_XOR_VALUE);
+	}
+
+	/// Append a MESSAGE-INTEGRITY attribute (RFC 5389 §15.4): HMAC-SHA1 over the
+	/// message (header + attributes preceding MESSAGE-INTEGRITY), with the header
+	/// length already counting the MESSAGE-INTEGRITY TLV. `key` is the short-term
+	/// credential (the ICE password). Add this BEFORE any FINGERPRINT.
+	void addMessageIntegrity(scope const(ubyte)[] key) @safe
+	{
+		auto body_ = encodeBody();
+		auto prefix = header(body_.length + MI_TLV) ~ body_;
+		auto mac = hmacSha1(key, prefix);
+		attributes ~= Attribute(ATTR_MESSAGE_INTEGRITY, mac.dup);
+	}
+
+	/// Verify the MESSAGE-INTEGRITY attribute under `key`. Attributes after it
+	/// (e.g. FINGERPRINT) are excluded from the HMAC, per the spec.
+	bool checkMessageIntegrity(scope const(ubyte)[] key) const @safe
+	{
+		size_t mi = size_t.max;
+		foreach (i, ref a; attributes)
+			if (a.typ == ATTR_MESSAGE_INTEGRITY)
+			{
+				mi = i;
+				break;
+			}
+		if (mi == size_t.max || attributes[mi].value.length != MESSAGE_INTEGRITY_SIZE)
+			return false;
+
+		Message m;
+		m.typ = typ;
+		m.transactionId = transactionId;
+		foreach (ref a; attributes[0 .. mi])
+			m.attributes ~= Attribute(a.typ, a.value.dup);
+		auto body_ = m.encodeBody();
+		auto prefix = m.header(body_.length + MI_TLV) ~ body_;
+		auto expected = hmacSha1(key, prefix);
+		return attributes[mi].value == expected[];
 	}
 
 	/// Parse a STUN message. Throws on a malformed header or truncated attribute.

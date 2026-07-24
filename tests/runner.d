@@ -7,5 +7,6 @@ int main(string[] args)
 	return args.runTests!(
 		"tests.stun.message_test",
 		"tests.stun.xoraddr_test",
+		"tests.util.hmac_test",
 	);
 }
