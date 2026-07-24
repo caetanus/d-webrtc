@@ -1,7 +1,7 @@
 {
 	"name": "webrtc",
-	"description": "WebRTC data-channel transport for D — laundered from webrtc-rs's sans-io 'rtc', crypto on libsodium",
-	"authors": ["caetano"],
+	"description": "Sans-io WebRTC data-channel engine for D (ICE + DTLS + SCTP + DCEP) — laundered from webrtc-rs's 'rtc', DTLS via OpenSSL",
+	"authors": ["Marcelo A Caetano"],
 	"license": "MIT",
 	"targetType": "library",
 	"sourcePaths": ["source"],

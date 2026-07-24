@@ -1,31 +1,93 @@
 # webrtc (D)
 
-A WebRTC **data-channel** transport for D — the engine libp2p's `webrtc-direct`
-needs (ICE → DTLS → SCTP → DCEP). It is a faithful, AI-generated **laundry** of
+A WebRTC **data-channel** engine for D — the transport stack libp2p's
+`webrtc-direct` needs: **ICE → DTLS → SCTP → DCEP**, assembled into a single
+`PeerConnection`.
+
+It is a faithful, AI-generated **laundry** of
 [webrtc-rs's sans-io rewrite `rtc`](https://github.com/webrtc-rs/rtc): pure state
-machines, no async runtime baked in, so it plugs into any I/O loop (vibe-core in
-libp2p-dlang) without a competing reactor.
+machines, **no async runtime baked in**. You feed it inbound UDP datagrams and
+drain outbound ones; it never touches a socket or a clock. That means it drops
+into any I/O loop (vibe-core, in libp2p-dlang) without a competing reactor.
 
-Crypto uses **libsodium** throughout (X25519, ChaCha20-Poly1305, SHA-256,
-Ed25519), the same choice as the rest of the libp2p-dlang stack. The two
-primitives libsodium doesn't provide — ECDSA P-256 and X.509 — are taken from a C
-library (OpenSSL/deimos) only if hand-porting them proves large; with Ed25519
-certs the two-node case needs neither.
+Everything below UDP and above the data channel is handled internally, so a
+caller deals only in datagrams and messages:
 
-This is a standalone dub package that libp2p-dlang consumes as a dependency.
+```
+DataChannels (DCEP)      application messages
+SCTP association         reliable, multiplexed streams — runs *inside* DTLS
+DTLS 1.2                 encryption + certificate-fingerprint pinning
+ICE agent                connectivity over UDP host candidates (STUN)
+UDP                      the caller's socket
+```
 
-## Layout (mirrors the `rtc-*` crates)
+## Crypto
 
-| module | laundered from | role |
-|--------|----------------|------|
-| `webrtc.stun`        | rtc-stun        | STUN (RFC 5389/5769) |
-| `webrtc.sctp`        | rtc-sctp        | SCTP association / streams |
-| `webrtc.ice`         | rtc-ice         | ICE agent (ice-lite server) |
-| `webrtc.dtls`        | rtc-dtls        | DTLS 1.2 handshake + record |
-| `webrtc.datachannel` | rtc-datachannel | DCEP (RFC 8832) |
+Per the project rule *libsodium → Deimos(OpenSSL) → hand-port*:
 
-Ground truth: `~/lab/webrtc-rtc`. Every rust unit test → a D parity test.
+- **libsodium** for the primitives it provides (SHA-256, HMAC building blocks,
+  randomness) used by STUN and SCTP.
+- **OpenSSL via `deimos.openssl`** for DTLS 1.2, the self-signed **ECDSA P-256**
+  certificate, and its X.509/SHA-256 fingerprint (the `a=fingerprint` / libp2p
+  `/certhash`). DTLS is *not* laundered from `rtc-dtls` — where a Deimos binding
+  exists, we use it.
+
+## Layout
+
+| module | source | role |
+|--------|--------|------|
+| `webrtc.stun`        | laundry of rtc-stun        | STUN message + attributes (RFC 5389/5769) |
+| `webrtc.sctp`        | laundry of rtc-sctp        | SCTP association, streams, queues, timers (RFC 4960) |
+| `webrtc.ice`         | laundry of rtc-ice         | ICE agent — connectivity checks + USE-CANDIDATE nomination |
+| `webrtc.dtls`        | OpenSSL via deimos.openssl | DTLS 1.2 transport + ECDSA P-256 certificate |
+| `webrtc.datachannel` | laundry of rtc-datachannel | DCEP data channels (RFC 8832) |
+| `webrtc.connection`  | —                          | `PeerConnection`: the four layers assembled |
+
+Only the **webrtc-direct** path is ported. TURN, mDNS, srflx/relay candidates,
+ICE-TCP, media (RTP/RTCP/SRTP), ICE role-conflict switching and keepalive are
+deliberately dropped.
+
+## Usage sketch
+
+```d
+import webrtc.connection;
+
+// Roles follow libp2p webrtc-direct: dialer = ICE-controlling / DTLS-client /
+// SCTP-client; listener is the mirror.
+auto pc = new PeerConnection(Perspective.dialer, localIceCreds, tieBreaker,
+    Certificate.generate());
+pc.addLocalCandidate(host("1.2.3.4", 40000));
+pc.setRemoteIce(remoteIceCreds, host("5.6.7.8", 50000));
+
+// Sans-io: pump datagrams from/to your UDP socket.
+foreach (dg; pc.gatherOutbound(nowMs)) socket.sendTo(dg.data, dg.dst);
+pc.handleDatagram(received, from, to, nowMs);
+
+// Once pc.isReady(), open and use a data channel.
+auto sid = pc.channels.open(DataChannelConfig("chat", "proto"));
+pc.channels.send(sid, cast(ubyte[]) "hello".dup, /*isString*/ true);
+```
+
+`peerFingerprint()` exposes the peer's certhash for multiaddr verification.
+
+## Status
+
+The engine is **complete and verified end to end** — over an in-memory datagram
+pump, two `PeerConnection`s bring up ICE + DTLS + SCTP, pin certificate
+fingerprints, and carry data-channel messages both ways across the whole stack.
+
+Deferred (loss-recovery only — the loss-free path is complete): SCTP
+fast-retransmit, T3-rtx timer-driven retransmission, PR-SCTP forward-TSN, stream
+reset/reconfig, and shutdown.
 
 ## Test
 
-    dub test        # unit-threaded + fluent-asserts
+    dub run -c ut     # unit-threaded + fluent-asserts (68 tests)
+
+Ground truth for the laundry: the `rtc-*` crates at
+[webrtc-rs/rtc](https://github.com/webrtc-rs/rtc). Every ported piece has a D
+parity test against its rust counterpart.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
