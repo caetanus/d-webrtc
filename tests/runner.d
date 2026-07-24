@@ -19,5 +19,7 @@ int main(string[] args)
 		"tests.datachannel.message_test",
 		"tests.sctp.association_test",
 		"tests.datachannel.channel_test",
+		"tests.ice.candidate_test",
+		"tests.ice.attributes_test",
 	);
 }
