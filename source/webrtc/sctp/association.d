@@ -77,6 +77,9 @@ private enum long rtoMinMs = 1000;
 private enum long rtoMaxMs = 60_000;
 private enum size_t fastRtxThreshold = 4; // missing reports before a fast retransmit
 private enum size_t mtu = 1200; // congestion-window unit
+private enum long hbIntervalMs = 30_000; // HB.interval (RFC 4960 §8.3)
+private enum ushort paramHeartbeatInfo = 1; // Heartbeat Info parameter type
+private enum size_t maxHeartbeatInfo = 64; // a real Heartbeat Info is a handful of bytes
 
 // INIT / INIT ACK carry these fixed fields before their parameters.
 private struct InitFields
@@ -154,6 +157,14 @@ final class Association
 
 	private size_t assocErrorCount; // consecutive retransmit failures (RFC 4960 §8.1)
 	private bool shutdownAckPending; // a coalesced SHUTDOWN ACK to (re)send
+
+	// HEARTBEAT (RFC 4960 §8.3): a periodic probe of an idle path.
+	private bool hbOutstanding;
+	private long hbSentAt;
+	private long lastHbSent;
+	private ubyte[] hbValue; // the Heartbeat Info parameter we last sent, echoed back on ACK
+	private bool hbAckPending; // a coalesced HEARTBEAT ACK to send (one per datagram)
+	private ubyte[] hbAckInfo; // the info to echo in it
 
 	this(Role role, ushort localPort, ushort remotePort) @trusted
 	{
@@ -272,6 +283,12 @@ final class Association
 				case Kind.abort:
 					if (verifyTag(p)) onAbort();
 					break;
+				case Kind.heartbeat:
+					if (verifyTag(p)) onHeartbeat(c);
+					break;
+				case Kind.heartbeatAck:
+					if (verifyTag(p)) onHeartbeatAck(c);
+					break;
 				case Kind.other:
 					break; // RE-CONFIG handled by a later layer
 				}
@@ -290,6 +307,8 @@ final class Association
 		if (active)
 			handleT3(now); // retransmit and probe throughout a graceful close too
 		handleT2(now);
+		if (st == AssocState.established)
+			handleHeartbeat(now);
 	}
 
 	// T1: re-send the in-flight INIT/COOKIE-ECHO, failing after the retransmit cap.
@@ -479,6 +498,11 @@ final class Association
 		{
 			outbox ~= sctpPacket(peerTag, [Chunk(ChunkType.shutdownAck, 0, null)]);
 			shutdownAckPending = false;
+		}
+		if (hbAckPending)
+		{
+			outbox ~= sctpPacket(peerTag, [Chunk(ChunkType.heartbeatAck, 0, hbAckInfo)]);
+			hbAckPending = false;
 		}
 		if (sackPending)
 		{
@@ -817,6 +841,73 @@ final class Association
 		clearT1();
 		clearT2();
 		t3Running = false;
+	}
+
+	// --- HEARTBEAT (RFC 4960 §8.3) ----------------------------------------------------------
+
+	// Answer a HEARTBEAT by echoing its Heartbeat Info parameter verbatim — but
+	// only on an established path, only for a bounded Info, and at most once per
+	// datagram (a packet stuffed with HEARTBEATs must not fan out into many ACKs).
+	private void onHeartbeat(ref Chunk c) @safe
+	{
+		if (st != AssocState.established)
+			return;
+		if (c.value.length > maxHeartbeatInfo)
+			return; // oversized Info: drop rather than echo it back
+		if (hbAckPending)
+			return; // already answering one this datagram
+		hbAckPending = true;
+		hbAckInfo = c.value.dup;
+	}
+
+	// A HEARTBEAT ACK carrying the info we sent confirms the path is alive.
+	private void onHeartbeatAck(ref Chunk c) @safe
+	{
+		if (hbOutstanding && c.value == hbValue)
+		{
+			hbOutstanding = false;
+			assocErrorCount = 0;
+		}
+	}
+
+	// Probe an idle path once per HB.interval; an unanswered probe is retried per
+	// RTO and, past the error cap, fails the association (path failure → §8.1).
+	private void handleHeartbeat(long now) @safe
+	{
+		// Data in flight already proves the path (T3/SACK cover it): drop a stale
+		// idle probe so its timeout cannot double-count against the §8.1 counter.
+		if (hbOutstanding && outstanding.length > 0)
+			hbOutstanding = false;
+		if (hbOutstanding)
+		{
+			if (now - hbSentAt < rto)
+				return;
+			if (++assocErrorCount > assocMaxRetrans)
+			{
+				st = AssocState.failed;
+				hbOutstanding = false;
+				return;
+			}
+			hbSentAt = now;
+			outbox ~= sctpPacket(peerTag, [Chunk(ChunkType.heartbeat, 0, hbValue)]); // retry
+		}
+		else if (outstanding.length == 0 && now - lastHbSent >= hbIntervalMs)
+		{
+			hbValue = newHeartbeatInfo();
+			hbOutstanding = true;
+			hbSentAt = now;
+			lastHbSent = now;
+			outbox ~= sctpPacket(peerTag, [Chunk(ChunkType.heartbeat, 0, hbValue)]);
+		}
+	}
+
+	private ubyte[] newHeartbeatInfo() @trusted
+	{
+		ubyte[] v = new ubyte[12];
+		writeBe16(v[0 .. 2], paramHeartbeatInfo);
+		writeBe16(v[2 .. 4], 12); // parameter length: 4 header + 8 nonce
+		randombytes_buf(v.ptr + 4, 8);
+		return v;
 	}
 
 	private void armT2(ubyte[] packet, long now) @safe
@@ -1310,6 +1401,8 @@ private enum Kind
 	shutdownAck,
 	shutdownComplete,
 	abort,
+	heartbeat,
+	heartbeatAck,
 	other,
 }
 
@@ -1337,6 +1430,10 @@ private Kind chunkKind(ubyte typ) @safe pure nothrow @nogc
 		return Kind.shutdownComplete;
 	case ChunkType.abort:
 		return Kind.abort;
+	case ChunkType.heartbeat:
+		return Kind.heartbeat;
+	case ChunkType.heartbeatAck:
+		return Kind.heartbeatAck;
 	default:
 		return Kind.other;
 	}
