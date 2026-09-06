@@ -1,0 +1,25 @@
+{
+	"name": "webrtc",
+	"description": "WebRTC data channels for D: a sans-io engine (ICE, DTLS, SCTP, DCEP) written from the RFCs, driven by whoever owns the socket",
+	"authors": ["Marcelo A Caetano"],
+	"license": "MIT",
+	"targetType": "library",
+	"targetPath": "bin",
+	"sourcePaths": ["source"],
+	"importPaths": ["source"],
+	"dependencies": { "libsodiumd": "~>0.2", "openssl": "~>3.4" },
+	"libs": ["crypto", "ssl"],
+	"configurations": [
+		{ "name": "library", "targetType": "library" },
+		{
+			"name": "ut",
+			"targetType": "executable",
+			"targetName": "webrtc-test",
+			"mainSourceFile": "tests/runner.d",
+			"sourcePaths": ["source", "tests"],
+			"importPaths": ["source", "tests"],
+			"dependencies": { "unit-threaded": "~>2.2", "fluent-asserts": "~>2.0" },
+			"dflags": ["-unittest"]
+		}
+	]
+}
