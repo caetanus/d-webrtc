@@ -197,6 +197,21 @@ final class Connection
 		advance(now);
 	}
 
+	/// Close at once: abort SCTP and send a DTLS close_notify immediately, so a
+	/// peer that is leaving (e.g. a process exiting) tells the far end to tear the
+	/// connection down now rather than after a timeout. The close_notify surfaces
+	/// through the next gatherOutbound.
+	void closeNow() @safe
+	{
+		if (st == ConnState.closed || st == ConnState.failed)
+			return;
+		if (sctpStarted)
+			assoc.abort();
+		if (dtlsDriving && dtls.isHandshakeComplete)
+			dtls.close(); // close_notify
+		st = ConnState.closed;
+	}
+
 	// --- state machine ----------------------------------------------------------------------
 
 	private void advance(long now) @safe

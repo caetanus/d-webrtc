@@ -19,6 +19,7 @@ import std.exception : enforce;
 import deimos.openssl.bio;
 import deimos.openssl.err : ERR_get_error, ERR_error_string_n;
 import deimos.openssl.evp : EVP_sha256;
+import deimos.openssl.srtp : SSL_CTX_set_tlsext_use_srtp;
 import deimos.openssl.ssl;
 import deimos.openssl.x509;
 import deimos.openssl.x509_vfy : X509_STORE_CTX;
@@ -64,6 +65,13 @@ final class DtlsTransport
 			"dtls: use_certificate failed");
 		enforce(SSL_CTX_use_PrivateKey(ctx, cast(EVP_PKEY*) cert.privateKey) == 1,
 			"dtls: use_PrivateKey failed");
+
+		// Offer the use_srtp extension (RFC 5764). webrtc-direct carries no media,
+		// but WebRTC stacks (webrtc-rs) require an SRTP profile to be negotiated
+		// before they consider DTLS established and start SCTP. Returns 0 on success.
+		enforce(SSL_CTX_set_tlsext_use_srtp(ctx,
+				"SRTP_AEAD_AES_128_GCM:SRTP_AES128_CM_SHA1_80".ptr) == 0,
+			"dtls: could not enable the use_srtp extension");
 
 		// Self-signed on both ends: accept the chain, then pin the fingerprint.
 		// The server must ask for the client's certificate to see it at all.
