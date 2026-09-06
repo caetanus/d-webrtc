@@ -3,5 +3,6 @@ int main(string[] args)
 {
 	return args.runTests!(
 		"tests.stun.message_test",
+		"tests.ice.agent_test",
 	);
 }
