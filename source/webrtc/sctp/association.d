@@ -81,6 +81,13 @@ private enum long hbIntervalMs = 30_000; // HB.interval (RFC 4960 §8.3)
 private enum ushort paramHeartbeatInfo = 1; // Heartbeat Info parameter type
 private enum size_t maxHeartbeatInfo = 64; // a real Heartbeat Info is a handful of bytes
 
+// RFC 6525 RE-CONFIG stream reset.
+private enum ushort paramOutgoingReset = 13; // Outgoing SSN Reset Request
+private enum ushort paramReconfigResponse = 16; // Re-configuration Response
+private enum uint reconfigSuccessNothing = 0; // Success - Nothing to do
+private enum uint reconfigSuccessPerformed = 1; // Success - Performed
+private enum size_t maxResetStreams = 256; // cap streams per request (bound the parse)
+
 // INIT / INIT ACK carry these fixed fields before their parameters.
 private struct InitFields
 {
@@ -165,6 +172,20 @@ final class Association
 	private ubyte[] hbValue; // the Heartbeat Info parameter we last sent, echoed back on ACK
 	private bool hbAckPending; // a coalesced HEARTBEAT ACK to send (one per datagram)
 	private ubyte[] hbAckInfo; // the info to echo in it
+
+	// RFC 6525 stream reset. One outgoing request at a time; the rest queue.
+	private uint reconfigReqSeq; // our next request sequence number
+	private uint reconfigExpectedInSeq; // the next inbound request sequence we expect
+	private bool reconfigPending; // a request is in flight
+	private uint reconfigPendingSeq; // its sequence number
+	private ushort[] reconfigPendingStreams; // the streams it resets
+	private ushort[] resetQueue; // streams awaiting a request while one is pending
+	private ubyte[] lastReconfigResponse; // cached, to answer a duplicate request
+	private ushort[] resetInbound; // streams the peer reset, drained by the caller
+	private bool reconfigRunning;
+	private long reconfigStartedAt;
+	private size_t reconfigTries;
+	private ubyte[] reconfigPacket; // the in-flight RE-CONFIG, for retransmission
 
 	this(Role role, ushort localPort, ushort remotePort) @trusted
 	{
@@ -289,8 +310,11 @@ final class Association
 				case Kind.heartbeatAck:
 					if (verifyTag(p)) onHeartbeatAck(c);
 					break;
+				case Kind.reConfig:
+					if (verifyTag(p)) onReConfig(c, now);
+					break;
 				case Kind.other:
-					break; // RE-CONFIG handled by a later layer
+					break; // an unrecognised chunk type: ignore
 				}
 			}
 		}
@@ -309,6 +333,8 @@ final class Association
 		handleT2(now);
 		if (st == AssocState.established)
 			handleHeartbeat(now);
+		if (active)
+			handleReconfig(now); // never retransmit into a closed/failed association
 	}
 
 	// T1: re-send the in-flight INIT/COOKIE-ECHO, failing after the retransmit cap.
@@ -470,11 +496,64 @@ final class Association
 		outstandingBytes = 0;
 		sackPending = false;
 		shutdownAckPending = false;
+		hbAckPending = false;
+		clearReconfig();
+		reconfigPending = false;
+		resetQueue = null;
 	}
 
 	private bool dataDrained() const @safe pure nothrow @nogc
 	{
 		return outstanding.length == 0 && sendQueue.length == 0;
+	}
+
+	// --- RFC 6525 stream reset --------------------------------------------------------------
+
+	/// Reset a stream (RFC 6525) — libp2p webrtc closes a data channel this way.
+	/// One request is in flight at a time; further resets queue behind it.
+	void resetStream(ushort streamId, long now) @safe
+	{
+		if (st != AssocState.established)
+			return;
+		if (reconfigPending)
+		{
+			import std.algorithm.searching : canFind;
+
+			// Dedup and cap: a stream already in flight or queued is not re-queued,
+			// and the queue is bounded (Law 1).
+			if (!reconfigPendingStreams.canFind(streamId) && !resetQueue.canFind(streamId)
+				&& resetQueue.length < maxResetStreams)
+				resetQueue ~= streamId;
+			return;
+		}
+		issueReset([streamId], now);
+	}
+
+	/// Whether a stream-reset request is still awaiting its response.
+	bool streamResetPending() const @safe pure nothrow @nogc
+	{
+		return reconfigPending;
+	}
+
+	/// Streams the peer has reset (drained), so the caller can close the matching
+	/// channels.
+	ushort[] takeResetStreams() @safe
+	{
+		auto s = resetInbound;
+		resetInbound = null;
+		return s;
+	}
+
+	private void issueReset(ushort[] streams, long now) @safe
+	{
+		if (streams.length > maxResetStreams)
+			streams = streams[0 .. maxResetStreams]; // bound the request parameter size
+		reconfigPending = true;
+		reconfigPendingSeq = reconfigReqSeq++;
+		reconfigPendingStreams = streams.dup;
+		auto param = outgoingResetRequest(reconfigPendingSeq, reconfigExpectedInSeq - 1,
+			nextTsn - 1, streams);
+		armReconfig(sctpPacket(peerTag, [Chunk(ChunkType.reConfig, 0, param)]), now);
 	}
 
 	private void sendShutdown(long now) @safe
@@ -910,6 +989,168 @@ final class Association
 		return v;
 	}
 
+	// --- RFC 6525 RE-CONFIG handling --------------------------------------------------------
+
+	private enum size_t maxReconfigParamsPerDatagram = 8; // bound the work one packet can trigger
+
+	private void onReConfig(ref Chunk c, long now) @safe
+	{
+		if (st != AssocState.established)
+			return;
+		// The chunk value is a sequence of TLV parameters. Responses to reset
+		// requests are gathered and sent in ONE packet, so a datagram packed with
+		// requests cannot fan out into many outbound packets.
+		ubyte[] responses;
+		size_t pos;
+		size_t params;
+		while (pos + 4 <= c.value.length && params < maxReconfigParamsPerDatagram)
+		{
+			immutable ptyp = readBe16(c.value[pos .. pos + 2]);
+			immutable plen = readBe16(c.value[pos + 2 .. pos + 4]);
+			enforce(plen >= 4 && pos + plen <= c.value.length, "sctp: bad RE-CONFIG parameter");
+			auto pval = c.value[pos + 4 .. pos + plen];
+			if (ptyp == paramOutgoingReset)
+				responses ~= handleIncomingReset(pval);
+			else if (ptyp == paramReconfigResponse)
+				handleResetResponse(pval, now);
+			pos += plen;
+			params++;
+			while (pos % 4 != 0 && pos < c.value.length)
+				pos++;
+		}
+		if (responses.length)
+			outbox ~= sctpPacket(peerTag, [Chunk(ChunkType.reConfig, 0, responses)]);
+	}
+
+	// Process one Outgoing SSN Reset Request; return the response parameter to
+	// bundle (empty if none).
+	private ubyte[] handleIncomingReset(scope const(ubyte)[] v) @safe
+	{
+		// reqSeq(4), respSeq(4), lastTsn(4), then stream numbers (2 each).
+		enforce(v.length >= 12 && (v.length - 12) % 2 == 0, "sctp: malformed reset request");
+		enforce((v.length - 12) / 2 <= maxResetStreams, "sctp: too many streams in a reset");
+		immutable reqSeq = readBe32(v[0 .. 4]);
+
+		// A duplicate of the last request: re-send the response we cached.
+		if (reqSeq == reconfigExpectedInSeq - 1 && lastReconfigResponse !is null)
+			return lastReconfigResponse;
+		if (reqSeq != reconfigExpectedInSeq)
+			return null; // out of sequence: ignore
+
+		// Reset the inbound streams: their sequence restarts, any held-but-
+		// undelivered ordered messages are dropped, and any partial fragments for
+		// the stream are discarded (they belong to the pre-reset era).
+		for (size_t i = 12; i < v.length; i += 2)
+		{
+			immutable s = readBe16(v[i .. i + 2]);
+			expectedSsn[s] = 0;
+			nextSsn.remove(s);
+			if (s in orderedHold)
+			{
+				foreach (ref m; orderedHold[s])
+					recvBuffered -= m.data.length > recvBuffered ? recvBuffered : m.data.length;
+				orderedHold.remove(s);
+			}
+			dropFragsForStream(s);
+			resetInbound ~= s;
+		}
+		reconfigExpectedInSeq++;
+		lastReconfigResponse = reconfigResponse(reqSeq, reconfigSuccessPerformed);
+		return lastReconfigResponse;
+	}
+
+	// Discard any received fragments belonging to a stream being reset, so a
+	// late-arriving End cannot reassemble a stale pre-reset message.
+	private void dropFragsForStream(ushort streamId) @safe
+	{
+		uint[] doomed;
+		foreach (tsn, ref f; frags)
+			if (f.streamId == streamId)
+				doomed ~= tsn;
+		foreach (tsn; doomed)
+		{
+			recvBuffered -= frags[tsn].payload.length > recvBuffered ? recvBuffered
+				: frags[tsn].payload.length;
+			frags.remove(tsn);
+		}
+	}
+
+	private void handleResetResponse(scope const(ubyte)[] v, long now) @safe
+	{
+		enforce(v.length >= 8, "sctp: malformed reset response");
+		immutable respSeq = readBe32(v[0 .. 4]);
+		immutable result = readBe32(v[4 .. 8]);
+		if (!reconfigPending || respSeq != reconfigPendingSeq)
+			return;
+
+		// Any matching response ends this request — stop retransmitting. On success
+		// our outbound sequence for those streams restarts; a failure (Denied /
+		// Bad-Sequence / In-Progress) is given up on rather than hammered until the
+		// association dies.
+		if (result == reconfigSuccessNothing || result == reconfigSuccessPerformed)
+			foreach (s; reconfigPendingStreams)
+				nextSsn[s] = 0;
+		reconfigPending = false;
+		clearReconfig();
+		if (resetQueue.length)
+		{
+			auto q = resetQueue;
+			resetQueue = null;
+			issueReset(q, now);
+		}
+	}
+
+	private ubyte[] outgoingResetRequest(uint reqSeq, uint respSeq, uint lastTsn, ushort[] streams) @safe
+	{
+		ubyte[] pv = new ubyte[12 + 2 * streams.length];
+		writeBe32(pv[0 .. 4], reqSeq);
+		writeBe32(pv[4 .. 8], respSeq);
+		writeBe32(pv[8 .. 12], lastTsn);
+		foreach (i, s; streams)
+			writeBe16(pv[12 + 2 * i .. 14 + 2 * i], s);
+		return paramTlv(paramOutgoingReset, pv);
+	}
+
+	private ubyte[] reconfigResponse(uint respSeq, uint result) @safe
+	{
+		ubyte[] pv = new ubyte[8];
+		writeBe32(pv[0 .. 4], respSeq);
+		writeBe32(pv[4 .. 8], result);
+		return paramTlv(paramReconfigResponse, pv);
+	}
+
+	private void armReconfig(ubyte[] packet, long now) @safe
+	{
+		reconfigPacket = packet;
+		reconfigStartedAt = now;
+		reconfigTries = 0;
+		reconfigRunning = true;
+		outbox ~= packet.dup;
+	}
+
+	private void clearReconfig() @safe pure nothrow @nogc
+	{
+		reconfigPacket = null;
+		reconfigRunning = false;
+		reconfigTries = 0;
+	}
+
+	// Retransmit an unanswered RE-CONFIG, failing the association past the cap.
+	private void handleReconfig(long now) @safe
+	{
+		if (!reconfigRunning || now - reconfigStartedAt < rto)
+			return;
+		if (reconfigTries >= assocMaxRetrans)
+		{
+			st = AssocState.failed;
+			clearReconfig();
+			return;
+		}
+		reconfigTries++;
+		reconfigStartedAt = now;
+		outbox ~= reconfigPacket.dup;
+	}
+
 	private void armT2(ubyte[] packet, long now) @safe
 	{
 		t2Packet = packet;
@@ -1225,6 +1466,9 @@ final class Association
 		peerRwnd = peerArwnd;
 		outstandingBytes = 0;
 		cwnd = initialCwnd;
+		// RFC 6525: request sequence numbers start at the initial TSN of each side.
+		reconfigReqSeq = localInitialTsn;
+		reconfigExpectedInSeq = peerInitialTsn;
 	}
 
 	// --- verification tag (RFC 4960 §8.5) ---------------------------------------------------
@@ -1403,6 +1647,7 @@ private enum Kind
 	abort,
 	heartbeat,
 	heartbeatAck,
+	reConfig,
 	other,
 }
 
@@ -1434,6 +1679,8 @@ private Kind chunkKind(ubyte typ) @safe pure nothrow @nogc
 		return Kind.heartbeat;
 	case ChunkType.heartbeatAck:
 		return Kind.heartbeatAck;
+	case ChunkType.reConfig:
+		return Kind.reConfig;
 	default:
 		return Kind.other;
 	}
@@ -1489,6 +1736,21 @@ private bool constantTimeEqual(scope const(ubyte)[] a, scope const(ubyte)[] b) @
 private ushort min16(ushort a, ushort b) @safe pure nothrow @nogc
 {
 	return a < b ? a : b;
+}
+
+// A TLV parameter: type(2), length(2, header included), value, padded to 4 bytes.
+private ubyte[] paramTlv(ushort typ, ubyte[] value) @safe pure
+{
+	ubyte[] p = new ubyte[4];
+	p[0] = cast(ubyte)(typ >> 8);
+	p[1] = cast(ubyte)(typ & 0xff);
+	immutable len = cast(ushort)(4 + value.length);
+	p[2] = cast(ubyte)(len >> 8);
+	p[3] = cast(ubyte)(len & 0xff);
+	p ~= value;
+	while (p.length % 4 != 0)
+		p ~= 0;
+	return p;
 }
 
 // TSN comparison in serial-number arithmetic (RFC 1982): a <= b even across the
