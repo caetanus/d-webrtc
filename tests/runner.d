@@ -12,5 +12,6 @@ int main(string[] args)
 		"tests.sctp.teardown_test",
 		"tests.sctp.heartbeat_test",
 		"tests.sctp.reconfig_test",
+		"tests.datachannel.channels_test",
 	);
 }
