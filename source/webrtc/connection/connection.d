@@ -118,6 +118,13 @@ final class Connection
 		return cert.sha256Fingerprint();
 	}
 
+	/// The peer's certificate fingerprint (valid once connected). The listener
+	/// uses it to name the remote; the dialer already pinned it.
+	ubyte[32] peerFingerprint() @safe
+	{
+		return dtls.peerFingerprint();
+	}
+
 	// --- observation ------------------------------------------------------------------------
 
 	ConnState state() const @safe pure nothrow @nogc
@@ -234,7 +241,19 @@ final class Connection
 		if (dtlsDriving && dtls.isHandshakeComplete && !fingerprintPinned)
 		{
 			fingerprintPinned = true;
-			if (!haveExpectedFp || !dtls.verifyPeerFingerprint(expectedFp))
+			// The dialer MUST pin — webrtc-direct puts the server's certhash in the
+			// address, so an absent expected fingerprint is a fail-closed error. The
+			// listener has no certhash for the client (the client's libp2p identity
+			// is proven later over Noise), so it accepts the peer cert unpinned.
+			if (haveExpectedFp)
+			{
+				if (!dtls.verifyPeerFingerprint(expectedFp))
+				{
+					st = ConnState.failed;
+					return;
+				}
+			}
+			else if (perspective == Perspective.dialer)
 			{
 				st = ConnState.failed;
 				return;

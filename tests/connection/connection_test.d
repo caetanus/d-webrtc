@@ -47,7 +47,8 @@ private Connection[2] connectedPair()
 	listener.addLocalCandidate(Candidate.host(bAddr.ip, bAddr.port));
 	listener.addRemoteCandidate(Candidate.host(aAddr.ip, aAddr.port));
 	listener.setRemoteCredentials(aCreds);
-	listener.setExpectedFingerprint(dialer.localFingerprint());
+	// The listener does not pin (no certhash for the client) — as in real
+	// webrtc-direct; identity is proven over Noise afterward.
 
 	ChannelEvent[] dEv, lEv;
 	pump(dialer, listener, 0, dEv, lEv,
@@ -63,6 +64,10 @@ unittest
 	auto pair = connectedPair();
 	pair[0].state.should.equal(ConnState.connected);
 	pair[1].state.should.equal(ConnState.connected);
+	// The listener, which pinned nothing, still learns the client's fingerprint.
+	auto seenByListener = pair[1].peerFingerprint();
+	auto clientFp = pair[0].localFingerprint();
+	seenByListener[].should.equal(clientFp[]);
 }
 
 // A wrong expected fingerprint fails the connection at the DTLS pin, not later.
@@ -82,7 +87,8 @@ unittest
 	listener.addLocalCandidate(Candidate.host(bAddr.ip, bAddr.port));
 	listener.addRemoteCandidate(Candidate.host(aAddr.ip, aAddr.port));
 	listener.setRemoteCredentials(aCreds);
-	listener.setExpectedFingerprint(dialer.localFingerprint());
+	// The listener does not pin (no certhash for the client) — as in real
+	// webrtc-direct; identity is proven over Noise afterward.
 
 	ChannelEvent[] dEv, lEv;
 	pump(dialer, listener, 0, dEv, lEv, () => dialer.state == ConnState.failed);
@@ -141,7 +147,8 @@ private Connection[2] makePair(bool dialerPins = true)
 	listener.addLocalCandidate(Candidate.host(bAddr.ip, bAddr.port));
 	listener.addRemoteCandidate(Candidate.host(aAddr.ip, aAddr.port));
 	listener.setRemoteCredentials(aCreds);
-	listener.setExpectedFingerprint(dialer.localFingerprint());
+	// The listener does not pin (no certhash for the client) — as in real
+	// webrtc-direct; identity is proven over Noise afterward.
 	return [dialer, listener];
 }
 
