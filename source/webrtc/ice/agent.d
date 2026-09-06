@@ -22,8 +22,10 @@
  *
  * Retransmission follows the §14 schedule (a fixed RTO, capped tries); a pair
  * with no answer fails, and when every pair has failed and none was selected the
- * agent reaches its Failed end state. Once connected it sends a Binding
- * Indication on the selected pair as a keepalive.
+ * agent reaches its Failed end state. Once connected, consent freshness (RFC
+ * 7675) keeps the selected pair alive with periodic Binding requests, and the
+ * connection fails if consent is not refreshed in time. An ICE restart re-runs
+ * checking under new credentials.
  */
 module webrtc.ice.agent;
 
@@ -79,8 +81,11 @@ struct OutboundStun
 private enum long taMs = 50;
 private enum long rtoMs = 500;
 private enum size_t maxTries = 7;
-// RFC 8445 §11: a Binding Indication as a keepalive on the selected pair.
-private enum long keepaliveMs = 15_000;
+// RFC 7675 consent freshness: a Binding request on the selected pair every
+// ~5 s keeps the path alive, and consent is lost if no valid response arrives
+// within 30 s — at which point the pair, and the connection, fail.
+private enum long consentIntervalMs = 5_000;
+private enum long consentTimeoutMs = 30_000;
 
 private enum PairState
 {
@@ -131,9 +136,12 @@ final class Agent
 
 	private bool haveSelected;
 	private TransportAddr[2] selected;
+	private uint selectedPriority; /// the selected local candidate's priority, for consent checks
 	private bool startedAny; /// a first check has gone out
 	private long lastCheckStart; /// ms; Ta pacing of new checks
-	private long lastKeepalive; /// ms; on the selected pair once connected
+	private TransactionId consentTxid; /// the in-flight consent check
+	private long lastConsentSent; /// ms; when the last consent check went out
+	private long lastConsentAt; /// ms; when consent was last confirmed by a response
 	private OutboundStun[] outbox;
 
 	this(Role role, Credentials local, ulong tieBreaker) @safe pure nothrow
@@ -164,6 +172,26 @@ final class Agent
 		if (remoteCandidates.canFind!(x => x.address == c.address && x.port == c.port))
 			return;
 		remoteCandidates ~= c;
+		formPairs();
+	}
+
+	/// ICE restart (RFC 8445 §9): new credentials for both sides, the check state
+	/// thrown away, and checking begun afresh over the existing candidates. A
+	/// connection that had been selected is no longer, until a pair is nominated
+	/// again.
+	void restart(Credentials newLocal, Credentials newRemote) @safe pure
+	{
+		local = newLocal;
+		remote = newRemote;
+		haveRemote = true;
+		pairs = null;
+		state = ConnectionState.newState;
+		haveSelected = false;
+		startedAny = false;
+		lastCheckStart = 0;
+		consentTxid = TransactionId.init;
+		lastConsentSent = 0;
+		lastConsentAt = 0;
 		formPairs();
 	}
 
@@ -272,6 +300,14 @@ final class Agent
 		if (!resp.checkMessageIntegrity(remote.pwd.representation))
 			return;
 
+		// A consent check was answered: the path is still alive.
+		if (haveSelected && resp.transactionId == consentTxid
+			&& from == selected[1] && to == selected[0])
+		{
+			lastConsentAt = now;
+			return;
+		}
+
 		foreach (ref p; pairs)
 		{
 			if (p.remoteAddr != from || p.localAddr != to)
@@ -340,11 +376,18 @@ final class Agent
 				}
 			}
 
-		// Keepalive on the selected pair.
-		if (state == ConnectionState.connected && now - lastKeepalive >= keepaliveMs)
+		// Consent freshness (RFC 7675) on the selected pair: lose consent and the
+		// connection fails; otherwise send a consent check every interval.
+		if (state == ConnectionState.connected)
 		{
-			outbox ~= keepaliveFor(selected[0], selected[1]);
-			lastKeepalive = now;
+			if (now - lastConsentAt >= consentTimeoutMs)
+				state = ConnectionState.failed;
+			else if (now - lastConsentSent >= consentIntervalMs)
+			{
+				consentTxid = Message.randomTransactionId();
+				outbox ~= consentCheck();
+				lastConsentSent = now;
+			}
 		}
 	}
 
@@ -374,13 +417,20 @@ final class Agent
 		return OutboundStun(p.localAddr, p.remoteAddr, m.encode);
 	}
 
-	private OutboundStun keepaliveFor(TransportAddr src, TransportAddr dst) @safe
+	// A consent check (RFC 7675): an ordinary authenticated Binding request on the
+	// selected pair, tracked by consentTxid so its response refreshes consent.
+	private OutboundStun consentCheck() @safe
 	{
 		Message m;
-		m.typ = bindingIndication;
-		m.transactionId = Message.randomTransactionId();
+		m.typ = bindingRequest;
+		m.transactionId = consentTxid;
+		m.attributes ~= Attribute(attrUsername, (remote.ufrag ~ ":" ~ local.ufrag).representation.dup);
+		m.attributes ~= Attribute(attrPriority, be32(selectedPriority));
+		m.attributes ~= Attribute(role == Role.controlling ? attrIceControlling : attrIceControlled,
+			be64(tieBreaker));
+		m.addMessageIntegrity(remote.pwd.representation);
 		m.addFingerprint();
-		return OutboundStun(src, dst, m.encode);
+		return OutboundStun(selected[0], selected[1], m.encode);
 	}
 
 	// --- bookkeeping ------------------------------------------------------------------------
@@ -414,9 +464,13 @@ final class Agent
 	private void select(ref Pair p, long now) @safe pure nothrow
 	{
 		selected = [p.localAddr, p.remoteAddr];
+		selectedPriority = p.local.priority;
 		haveSelected = true;
 		state = ConnectionState.connected;
-		lastKeepalive = now;
+		// Consent starts fresh at selection; the first consent check follows an
+		// interval later.
+		lastConsentAt = now;
+		lastConsentSent = now;
 	}
 
 	private void maybeFail() @safe pure nothrow

@@ -38,6 +38,44 @@ private bool pump(Agent a, Agent b) @safe
 	return a.isConnected && b.isConnected;
 }
 
+// Ferry both directions for a stretch of simulated time, so consent checks and
+// their responses flow. Returns the clock it stopped at.
+private long ferry(Agent a, Agent b, long start, long stepMs, int ticks) @safe
+{
+	long now = start;
+	foreach (_; 0 .. ticks)
+	{
+		a.handleTimeout(now);
+		b.handleTimeout(now);
+		auto fromA = a.gatherOutbound(now);
+		auto fromB = b.gatherOutbound(now);
+		foreach (o; fromA)
+			b.handleInbound(o.data, o.src, o.dst, now);
+		foreach (o; fromB)
+			a.handleInbound(o.data, o.src, o.dst, now);
+		now += stepMs;
+	}
+	return now;
+}
+
+private Agent controllingAgent() @safe
+{
+	auto a = new Agent(Role.controlling, aCreds, 0x2222_2222_2222_2222);
+	a.setRemoteCredentials(bCreds);
+	a.addLocalCandidate(Candidate.host(aAddr.ip, aAddr.port));
+	a.addRemoteCandidate(Candidate.host(bAddr.ip, bAddr.port));
+	return a;
+}
+
+private Agent controlledAgent() @safe
+{
+	auto b = new Agent(Role.controlled, bCreds, 0x1111_1111_1111_1111);
+	b.setRemoteCredentials(aCreds);
+	b.addLocalCandidate(Candidate.host(bAddr.ip, bAddr.port));
+	b.addRemoteCandidate(Candidate.host(aAddr.ip, aAddr.port));
+	return b;
+}
+
 @("ice: a controlling and a controlled agent nominate the same pair")
 unittest
 {
@@ -144,4 +182,60 @@ unittest
 	for (long now = 1000; now <= 8000 && !a.isConnected; now += 500)
 		a.handleTimeout(now);
 	a.connectionState.should.equal(ConnectionState.failed);
+}
+
+// Once connected, consent checks flow and are answered, so the connection holds
+// well past the consent timeout.
+@("ice: consent freshness keeps a connected pair alive")
+unittest
+{
+	auto a = controllingAgent();
+	auto b = controlledAgent();
+	pump(a, b).should.equal(true);
+
+	// 60 s of ferried traffic — twelve consent intervals, twice the timeout.
+	ferry(a, b, 200, 1000, 60);
+
+	a.isConnected.should.equal(true);
+	b.isConnected.should.equal(true);
+}
+
+// If the path goes dead after connecting, consent is not refreshed and the
+// controlling agent fails rather than believing forever it is still connected.
+@("ice: lost consent fails the connection")
+unittest
+{
+	auto a = controllingAgent();
+	auto b = controlledAgent();
+	pump(a, b).should.equal(true);
+	a.isConnected.should.equal(true);
+
+	// The peer is gone: advance A's clock past the consent timeout with nothing
+	// coming back.
+	for (long now = 1000; now <= 40_000 && a.isConnected; now += 1000)
+		a.handleTimeout(now);
+	a.connectionState.should.equal(ConnectionState.failed);
+}
+
+// A restart with fresh credentials drops the selection and re-runs checking; the
+// same pair is nominated again under the new credentials.
+@("ice: an ICE restart reconnects under new credentials")
+unittest
+{
+	auto a = controllingAgent();
+	auto b = controlledAgent();
+	pump(a, b).should.equal(true);
+
+	auto a2 = Credentials("A2AAAAAA", "a2aaaaaaaaaaaaaaaaaaaa");
+	auto b2 = Credentials("B2BBBBBB", "b2bbbbbbbbbbbbbbbbbbbb");
+	a.restart(a2, b2);
+	b.restart(b2, a2);
+	a.isConnected.should.equal(false);
+	a.connectionState.should.equal(ConnectionState.checking);
+
+	pump(a, b).should.equal(true);
+	TransportAddr al, ar;
+	a.selectedPair(al, ar).should.equal(true);
+	al.port.should.equal(aAddr.port);
+	ar.port.should.equal(bAddr.port);
 }
