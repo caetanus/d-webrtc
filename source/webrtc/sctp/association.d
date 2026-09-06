@@ -60,12 +60,18 @@ private enum long cookieLifeMs = 60_000;
 private enum size_t maxPayload = 1024;
 private enum size_t maxMessage = 256 * 1024; // RFC 8831 / DESIGN.md reassembly bound
 private enum size_t dataHeaderLen = 12; // TSN(4) + stream(2) + SSN(2) + PPID(4)
-private enum size_t initialCwnd = 4 * 1500; // RFC 4960 §7.2.1
+private enum size_t initialCwnd = 4 * mtu; // RFC 4960 §7.2.1
 private enum size_t maxCwnd = 1024 * 1024; // cap congestion-window growth
 private enum size_t recvWindow = 128 * 1024; // our advertised a_rwnd and hard receive cap
 private enum size_t sendBufferCap = 1024 * 1024; // app-queued bytes we will hold before refusing
 private enum size_t maxGapBlocks = 32; // keep a SACK inside one DTLS record
 private enum size_t maxDupTsns = 32;
+
+// RFC 4960 §6.3.1 retransmission timeout bounds and the fast-retransmit trigger.
+private enum long rtoMinMs = 1000;
+private enum long rtoMaxMs = 60_000;
+private enum size_t fastRtxThreshold = 4; // missing reports before a fast retransmit
+private enum size_t mtu = 1200; // congestion-window unit
 
 // INIT / INIT ACK carry these fixed fields before their parameters.
 private struct InitFields
@@ -123,8 +129,17 @@ final class Association
 	private uint[] dupTsns; // duplicate TSNs to report in the next SACK
 	private bool sackPending;
 	private size_t cwnd = initialCwnd;
+	private size_t ssthresh = size_t.max; // slow-start threshold (RFC 4960 §7.2.1)
 	private size_t recvBuffered; // bytes held in the receive path (frags + held + inbox)
 	private size_t sendQueuedBytes; // app payload queued but not yet handed to the wire
+
+	// T3-rtx (RFC 4960 §6.3): one retransmission timer, plus the RTT estimator.
+	private bool t3Running;
+	private long t3StartedAt;
+	private long rto = rtoInitialMs;
+	private long srtt;
+	private long rttvar;
+	private bool haveRtt;
 
 	this(Role role, ushort localPort, ushort remotePort) @trusted
 	{
@@ -169,6 +184,25 @@ final class Association
 		return recvWindow > recvBuffered ? recvWindow - recvBuffered : 0;
 	}
 
+	/// Congestion control state, exposed read-only so the retransmission
+	/// invariants can be observed and tested (they are not secret).
+	size_t congestionWindow() const @safe pure nothrow @nogc
+	{
+		return cwnd;
+	}
+
+	/// The current retransmission timeout in milliseconds.
+	long retransmitTimeout() const @safe pure nothrow @nogc
+	{
+		return rto;
+	}
+
+	/// The slow-start threshold in bytes.
+	size_t slowStartThreshold() const @safe pure nothrow @nogc
+	{
+		return ssthresh;
+	}
+
 	// --- driving ----------------------------------------------------------------------------
 
 	/// The initiator opens the association: send INIT, await INIT ACK. On the
@@ -210,7 +244,7 @@ final class Association
 					if (verifyTag(p)) onData(c);
 					break;
 				case Kind.sack:
-					if (verifyTag(p)) onSack(c);
+					if (verifyTag(p)) onSack(c, now);
 					break;
 				case Kind.other:
 					break; // teardown / RE-CONFIG handled by a later layer
@@ -223,9 +257,16 @@ final class Association
 		}
 	}
 
-	/// The T1 retransmission schedule: re-send the in-flight INIT/COOKIE-ECHO, and
-	/// fail the association once the retransmit cap is reached.
+	/// The retransmission timers: T1 for the handshake, T3-rtx for DATA.
 	void handleTimeout(long now) @safe
+	{
+		handleT1(now);
+		if (st == AssocState.established)
+			handleT3(now);
+	}
+
+	// T1: re-send the in-flight INIT/COOKIE-ECHO, failing after the retransmit cap.
+	private void handleT1(long now) @safe
 	{
 		if (t1Packet is null)
 			return;
@@ -242,11 +283,46 @@ final class Association
 		outbox ~= t1Packet.dup;
 	}
 
-	/// Datagrams queued to send, each already a complete SCTP packet. Flushes a
-	/// pending SACK and as much window-permitted DATA as will go.
-	ubyte[][] takeOutbound() @safe
+	// T3-rtx (RFC 4960 §6.3.3): on expiry, back off the RTO, collapse the
+	// congestion window, and retransmit the earliest unacked chunk. With the
+	// window shut and nothing in flight, a zero-window probe rides the same timer.
+	private void handleT3(long now) @safe
 	{
-		flush();
+		if (!t3Running && sendQueue.length && peerRwnd == 0 && outstanding.length == 0)
+		{
+			t3Running = true; // arm the persist/probe timer
+			t3StartedAt = now;
+		}
+		if (!t3Running || now - t3StartedAt < rto)
+			return;
+
+		if (outstanding.length)
+		{
+			ssthresh = cwnd / 2 > 4 * mtu ? cwnd / 2 : 4 * mtu;
+			cwnd = mtu;
+			rto = rto * 2 > rtoMaxMs ? rtoMaxMs : rto * 2; // exponential backoff
+			outstanding[0].sentAt = now;
+			outstanding[0].retransmitted = true;
+			outstanding[0].missing = 0;
+			outbox ~= sctpPacket(peerTag, [outstanding[0].chunk]);
+			t3StartedAt = now;
+		}
+		else if (sendQueue.length && peerRwnd == 0)
+		{
+			rto = rto * 2 > rtoMaxMs ? rtoMaxMs : rto * 2;
+			forceOneChunk(now); // probe past the closed window to elicit a SACK
+			t3StartedAt = now;
+		}
+		else
+			t3Running = false;
+	}
+
+	/// Datagrams queued to send, each already a complete SCTP packet. Flushes a
+	/// pending SACK and as much window-permitted DATA as will go. `now` stamps the
+	/// send time that the RTT estimator and T3-rtx timer read.
+	ubyte[][] takeOutbound(long now = 0) @safe
+	{
+		flush(now);
 		auto o = outbox;
 		outbox = null;
 		return o;
@@ -307,7 +383,7 @@ final class Association
 
 	// --- outbound flush ---------------------------------------------------------------------
 
-	private void flush() @safe
+	private void flush(long now) @safe
 	{
 		if (sackPending)
 		{
@@ -325,11 +401,91 @@ final class Association
 			sendQueue = sendQueue[1 .. $];
 			sendQueuedBytes -= payload > sendQueuedBytes ? sendQueuedBytes : payload;
 			uint tsn = readBe32(c.value[0 .. 4]);
-			outstanding ~= Outstanding(tsn, c, payload);
+			outstanding ~= Outstanding(tsn, c, payload, now, false, 0, false);
 			outstandingBytes += payload;
 			peerRwnd = payload > peerRwnd ? 0 : cast(uint)(peerRwnd - payload);
 			outbox ~= sctpPacket(peerTag, [c]);
+			startT3(now); // arm the retransmission timer once data is in flight
 		}
+	}
+
+	// Send one queued chunk regardless of the window — a zero-window probe.
+	private void forceOneChunk(long now) @safe
+	{
+		if (sendQueue.length == 0)
+			return;
+		auto c = sendQueue[0];
+		sendQueue = sendQueue[1 .. $];
+		immutable payload = c.value.length - dataHeaderLen;
+		sendQueuedBytes -= payload > sendQueuedBytes ? sendQueuedBytes : payload;
+		immutable tsn = readBe32(c.value[0 .. 4]);
+		outstanding ~= Outstanding(tsn, c, payload, now, false, 0, false);
+		outstandingBytes += payload;
+		outbox ~= sctpPacket(peerTag, [c]);
+	}
+
+	// Fast retransmit (RFC 4960 §7.2.4): a chunk reported missing by four SACKs is
+	// resent at once, and the congestion window is halved once per event.
+	private void fastRetransmit(long now) @safe
+	{
+		bool adjusted;
+		foreach (ref o; outstanding)
+		{
+			if (o.missing < fastRtxThreshold || o.fastRetransmitted)
+				continue;
+			if (!adjusted)
+			{
+				ssthresh = cwnd / 2 > 4 * mtu ? cwnd / 2 : 4 * mtu;
+				cwnd = ssthresh;
+				adjusted = true;
+			}
+			o.fastRetransmitted = true;
+			o.missing = 0;
+			o.sentAt = now;
+			o.retransmitted = true;
+			outbox ~= sctpPacket(peerTag, [o.chunk]);
+		}
+		if (adjusted)
+			startT3(now); // R1: keep the timer armed after a (re)transmission
+	}
+
+	// RFC 4960 §6.3.1 RTT estimator, clamped to [RTO.Min, RTO.Max].
+	private void updateRto(long r) @safe pure nothrow @nogc
+	{
+		if (r < 0)
+			r = 0;
+		if (!haveRtt)
+		{
+			srtt = r;
+			rttvar = r / 2;
+			haveRtt = true;
+		}
+		else
+		{
+			immutable delta = srtt > r ? srtt - r : r - srtt;
+			rttvar = (3 * rttvar + delta) / 4;
+			srtt = (7 * srtt + r) / 8;
+		}
+		rto = srtt + 4 * rttvar;
+		if (rto < rtoMinMs)
+			rto = rtoMinMs;
+		if (rto > rtoMaxMs)
+			rto = rtoMaxMs;
+	}
+
+	private void startT3(long now) @safe pure nothrow @nogc
+	{
+		if (!t3Running)
+		{
+			t3Running = true;
+			t3StartedAt = now;
+		}
+	}
+
+	private void startT3Restart(long now) @safe pure nothrow @nogc
+	{
+		t3Running = true;
+		t3StartedAt = now;
 	}
 
 	// --- inbound DATA / SACK ----------------------------------------------------------------
@@ -384,7 +540,7 @@ final class Association
 		sackPending = true;
 	}
 
-	private void onSack(ref Chunk c) @safe
+	private void onSack(ref Chunk c, long now) @safe
 	{
 		if (st != AssocState.established)
 			return;
@@ -395,15 +551,35 @@ final class Association
 		immutable numDup = readBe16(c.value[10 .. 12]);
 		enforce(12 + numGap * 4 + numDup * 4 <= c.value.length, "sctp: SACK runs past the chunk");
 
-		// Drop everything cumulatively acknowledged.
+		// The earliest outstanding TSN, captured before the prune, for the RFC 4960
+		// §6.3.2 R3 restart rule (restart only when the OLDEST chunk is acked).
+		immutable hadOutstanding = outstanding.length > 0;
+		immutable earliestTsn = hadOutstanding ? outstanding[0].tsn : 0;
+
+		// The highest TSN this SACK acknowledges (cumulative or any gap block) — a
+		// chunk below it that is still unacked has a "missing report".
+		uint highestAcked = cumAck;
+		{
+			size_t pos = 12;
+			foreach (_; 0 .. numGap)
+			{
+				immutable endg = cumAck + readBe16(c.value[pos + 2 .. pos + 4]);
+				if (!tsnLeq(endg, highestAcked))
+					highestAcked = endg;
+				pos += 4;
+			}
+		}
+
+		// Prune acked chunks, sample the RTT from one non-retransmitted ack, and
+		// count missing reports for the rest.
 		size_t freed;
 		size_t kept;
+		bool sampled;
 		foreach (ref o; outstanding)
 		{
 			bool acked = tsnLeq(o.tsn, cumAck);
 			if (!acked)
 			{
-				// Also honour gap-ack blocks (relative to the cumulative point).
 				size_t pos = 12;
 				foreach (_; 0 .. numGap)
 				{
@@ -418,18 +594,49 @@ final class Association
 				}
 			}
 			if (acked)
+			{
 				freed += o.payloadLen;
+				if (!sampled && !o.retransmitted) // Karn: never sample a retransmit
+				{
+					updateRto(now - o.sentAt);
+					sampled = true;
+				}
+			}
 			else
+			{
+				// A still-unacked chunk that sits below a TSN this SACK acked has a
+				// missing report (it cannot equal an acked TSN).
+				if (tsnLeq(o.tsn, highestAcked))
+					o.missing++;
 				outstanding[kept++] = o;
+			}
 		}
 		outstanding = outstanding[0 .. kept];
 		outstandingBytes -= freed > outstandingBytes ? outstandingBytes : freed;
 
-		// Congestion window growth (slow start, simplified), capped, and the peer's
-		// window recomputed from what it now reports minus what is still in flight.
-		if (freed > 0 && cwnd < maxCwnd)
-			cwnd += freed < 1500 ? freed : 1500;
+		// Congestion control (RFC 4960 §7.2): slow start below ssthresh, else
+		// congestion avoidance; capped.
+		if (freed > 0)
+		{
+			if (cwnd <= ssthresh)
+				cwnd += freed < mtu ? freed : mtu;
+			else
+				cwnd += mtu;
+			if (cwnd > maxCwnd)
+				cwnd = maxCwnd;
+		}
 		peerRwnd = aRwnd > outstandingBytes ? cast(uint)(aRwnd - outstandingBytes) : 0;
+
+		fastRetransmit(now);
+
+		// T3 (RFC 4960 §6.3.2): stop when nothing is outstanding (R2); restart ONLY
+		// when the earliest outstanding chunk was acked (R3). A gap-ack of a higher
+		// chunk while the oldest is still lost must NOT reset the timer, so a lost
+		// chunk's deadline cannot be deferred forever.
+		if (outstanding.length == 0)
+			t3Running = false;
+		else if (hadOutstanding && tsnLeq(earliestTsn, cumAck))
+			startT3Restart(now);
 	}
 
 	// --- reassembly and delivery ------------------------------------------------------------
@@ -924,6 +1131,10 @@ private struct Outstanding
 	uint tsn;
 	Chunk chunk;
 	size_t payloadLen;
+	long sentAt; // when it last went out (for the RTT sample)
+	bool retransmitted; // never sample RTT from a retransmitted chunk (Karn's algorithm)
+	size_t missing; // gap-ack "missing report" count toward a fast retransmit
+	bool fastRetransmitted; // fast-retransmitted once already
 }
 
 // A received DATA fragment awaiting reassembly.

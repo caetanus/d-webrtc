@@ -465,3 +465,227 @@ unittest
 	refused.should.equal(true);
 	client.state.should.equal(AssocState.established); // refusal, not death
 }
+
+// A DATA chunk lost in flight is recovered: with the first fragment dropped, the
+// message is still delivered whole once the T3 timer retransmits it.
+@("sctp: a dropped DATA chunk is recovered by retransmission")
+unittest
+{
+	auto client = new Association(Role.client, 5000, 5000);
+	auto server = new Association(Role.server, 5000, 5000);
+	establish(client, server);
+
+	ubyte[] payload = new ubyte[5000]; // ~5 fragments
+	foreach (i; 0 .. payload.length)
+		payload[i] = cast(ubyte)(i * 3 + 2);
+	client.send(0, 55, payload);
+
+	long now = 0;
+	bool dropped;
+	ubyte[] got;
+	foreach (_; 0 .. 100)
+	{
+		client.handleTimeout(now);
+		server.handleTimeout(now);
+		foreach (d; client.takeOutbound(now))
+		{
+			auto pk = Packet.decode(d);
+			// Drop the very first DATA packet exactly once to simulate loss.
+			if (!dropped && pk.chunks.length && pk.chunks[0].typ == ChunkType.data)
+			{
+				dropped = true;
+				continue;
+			}
+			server.handleInbound(d, now);
+		}
+		foreach (d; server.takeOutbound(now))
+			client.handleInbound(d, now);
+		auto msgs = server.receive();
+		if (msgs.length)
+		{
+			got = msgs[0].data;
+			break;
+		}
+		now += 500;
+	}
+	dropped.should.equal(true); // a chunk really was lost
+	got.should.equal(payload); // and the message still arrived whole
+}
+
+// Four SACKs reporting the same chunk missing trigger a fast retransmit before
+// the T3 timer would fire.
+@("sctp: four missing reports trigger a fast retransmit")
+unittest
+{
+	auto client = new Association(Role.client, 5000, 5000);
+	auto server = new Association(Role.server, 5000, 5000);
+	establish(client, server);
+
+	client.send(0, 55, new ubyte[5000]); // five fragments X .. X+4
+	auto sent = client.takeOutbound(0);
+	immutable firstTsn = readU32(Packet.decode(sent[0]).chunks[0].value[0 .. 4]);
+
+	// A SACK that gap-acks X+1..X+4 but never X (cumulative stays X-1).
+	ubyte[] sackVal = new ubyte[16];
+	writeU32(sackVal[0 .. 4], firstTsn - 1);
+	writeU32(sackVal[4 .. 8], 200_000);
+	writeU16(sackVal[8 .. 10], 1);
+	writeU16(sackVal[10 .. 12], 0);
+	writeU16(sackVal[12 .. 14], 2); // start offset (X+1)
+	writeU16(sackVal[14 .. 16], 5); // end offset (X+4)
+
+	Packet sack;
+	sack.srcPort = 5000;
+	sack.dstPort = 5000;
+	sack.verificationTag = client.localInitiateTag;
+	sack.chunks ~= Chunk(ChunkType.sack, 0, sackVal);
+
+	// Four identical SACKs: the fourth reaches the missing-report threshold.
+	foreach (i; 0 .. 4)
+		client.handleInbound(sack.encode, 100 + i);
+	auto outs = client.takeOutbound(200);
+
+	// The missing chunk X is retransmitted. Other chunks freed by the ack may also
+	// go out as the window reopens, so look for X rather than demanding it alone.
+	bool sawRetransmit;
+	foreach (d; outs)
+	{
+		auto pk = Packet.decode(d);
+		if (pk.chunks[0].typ == ChunkType.data && readU32(pk.chunks[0].value[0 .. 4]) == firstTsn)
+			sawRetransmit = true;
+	}
+	sawRetransmit.should.equal(true);
+}
+
+// With the peer's window shut and data queued, a zero-window probe is sent when
+// the timer fires, so the connection cannot deadlock waiting for a SACK.
+@("sctp: a zero-window probe is sent when the window is shut")
+unittest
+{
+	auto client = new Association(Role.client, 5000, 5000);
+	auto server = new Association(Role.server, 5000, 5000);
+	establish(client, server);
+
+	client.send(0, 53, cast(ubyte[]) "first".dup);
+	auto sent = client.takeOutbound(0);
+	immutable tsn0 = readU32(Packet.decode(sent[0]).chunks[0].value[0 .. 4]);
+
+	// Acknowledge it but advertise a zero window.
+	ubyte[] sackVal = new ubyte[12];
+	writeU32(sackVal[0 .. 4], tsn0);
+	writeU32(sackVal[4 .. 8], 0); // a_rwnd = 0
+	writeU16(sackVal[8 .. 10], 0);
+	writeU16(sackVal[10 .. 12], 0);
+	Packet sack;
+	sack.srcPort = 5000;
+	sack.dstPort = 5000;
+	sack.verificationTag = client.localInitiateTag;
+	sack.chunks ~= Chunk(ChunkType.sack, 0, sackVal);
+	client.handleInbound(sack.encode, 100);
+	client.bytesInFlight.should.equal(0u);
+
+	// Queue more; the shut window holds it back.
+	client.send(0, 53, cast(ubyte[]) "second".dup);
+	client.takeOutbound(200).length.should.equal(0);
+
+	// Arm the probe timer, then fire it a full RTO later.
+	client.handleTimeout(200);
+	client.handleTimeout(200 + 60_000);
+	auto probe = client.takeOutbound(60_200);
+	probe.length.should.equal(1);
+	Packet.decode(probe[0]).chunks[0].typ.should.equal(cast(ubyte) ChunkType.data);
+}
+
+// On a T3 expiry the congestion window collapses to one MTU, ssthresh becomes
+// max(cwnd/2, 4·MTU), and the RTO doubles — the RFC 4960 §6.3.3 / §7.2.3 math,
+// now observable.
+@("sctp: a T3 expiry collapses cwnd and backs off the RTO")
+unittest
+{
+	auto client = new Association(Role.client, 5000, 5000);
+	auto server = new Association(Role.server, 5000, 5000);
+	establish(client, server);
+
+	client.send(0, 53, new ubyte[500]); // one fragment
+	client.takeOutbound(0); // sent, T3 armed at now=0
+	immutable cwnd0 = client.congestionWindow; // 4 * 1200
+	immutable rto0 = client.retransmitTimeout; // RTO.Initial, no sample yet
+	rto0.should.equal(3000L);
+
+	client.handleTimeout(rto0); // now == deadline: T3 fires
+	client.congestionWindow.should.equal(1200u); // one MTU
+	client.slowStartThreshold.should.equal(4800u); // max(cwnd0/2=2400, 4*MTU=4800)
+	client.retransmitTimeout.should.equal(6000L); // doubled
+}
+
+// Karn's algorithm: the RTT is never sampled from a retransmitted chunk, so
+// acking one leaves the backed-off RTO unchanged.
+@("sctp: an ack of a retransmitted chunk does not resample the RTO")
+unittest
+{
+	auto client = new Association(Role.client, 5000, 5000);
+	auto server = new Association(Role.server, 5000, 5000);
+	establish(client, server);
+
+	client.send(0, 53, new ubyte[500]);
+	auto sent = client.takeOutbound(0);
+	immutable tsn = readU32(Packet.decode(sent[0]).chunks[0].value[0 .. 4]);
+	client.handleTimeout(3000); // T3 expiry: chunk retransmitted, RTO now 6000
+	client.retransmitTimeout.should.equal(6000L);
+
+	// Ack the (retransmitted) chunk: Karn forbids a sample, so RTO stays put.
+	ubyte[] sackVal = new ubyte[12];
+	writeU32(sackVal[0 .. 4], tsn);
+	writeU32(sackVal[4 .. 8], 200_000);
+	writeU16(sackVal[8 .. 10], 0);
+	writeU16(sackVal[10 .. 12], 0);
+	Packet sack;
+	sack.srcPort = 5000;
+	sack.dstPort = 5000;
+	sack.verificationTag = client.localInitiateTag;
+	sack.chunks ~= Chunk(ChunkType.sack, 0, sackVal);
+	client.handleInbound(sack.encode, 3100);
+	client.retransmitTimeout.should.equal(6000L); // unchanged — no sample taken
+}
+
+// RFC 4960 §6.3.2 R3: a gap-ack of a HIGHER chunk while the earliest is still
+// lost must not defer the T3 deadline, so the lost chunk is still retransmitted
+// on the original schedule.
+@("sctp: a gap-ack of a higher chunk does not defer T3 for a lost earlier one")
+unittest
+{
+	auto client = new Association(Role.client, 5000, 5000);
+	auto server = new Association(Role.server, 5000, 5000);
+	establish(client, server);
+
+	client.send(0, 53, new ubyte[2000]); // two fragments X, X+1
+	auto sent = client.takeOutbound(0); // T3 armed at now=0
+	immutable firstTsn = readU32(Packet.decode(sent[0]).chunks[0].value[0 .. 4]);
+
+	// Gap-ack only X+1 (offset 2 above cumulative X-1); X stays lost.
+	ubyte[] sackVal = new ubyte[16];
+	writeU32(sackVal[0 .. 4], firstTsn - 1);
+	writeU32(sackVal[4 .. 8], 200_000);
+	writeU16(sackVal[8 .. 10], 1);
+	writeU16(sackVal[10 .. 12], 0);
+	writeU16(sackVal[12 .. 14], 2);
+	writeU16(sackVal[14 .. 16], 2);
+	Packet sack;
+	sack.srcPort = 5000;
+	sack.dstPort = 5000;
+	sack.verificationTag = client.localInitiateTag;
+	sack.chunks ~= Chunk(ChunkType.sack, 0, sackVal);
+	client.handleInbound(sack.encode, 100); // T3 must NOT be restarted here
+
+	// The original T3 deadline (0 + 3000) still holds: firing at 3000 retransmits X.
+	client.handleTimeout(3000);
+	auto outs = client.takeOutbound(3000);
+	bool sawX;
+	foreach (d; outs)
+	{
+		auto pk = Packet.decode(d);
+		if (pk.chunks[0].typ == ChunkType.data && readU32(pk.chunks[0].value[0 .. 4]) == firstTsn)
+			sawX = true;
+	}
+	sawX.should.equal(true);
+}
