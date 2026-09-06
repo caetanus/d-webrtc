@@ -1042,7 +1042,7 @@ final class Association
 		// the stream are discarded (they belong to the pre-reset era).
 		for (size_t i = 12; i < v.length; i += 2)
 		{
-			immutable s = readBe16(v[i .. i + 2]);
+			ushort s = readBe16(v[i .. i + 2]);
 			expectedSsn[s] = 0;
 			nextSsn.remove(s);
 			if (s in orderedHold)

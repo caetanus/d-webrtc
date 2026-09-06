@@ -27,6 +27,7 @@ import webrtc.ice.agent : Agent, IceRole = Role, Credentials, TransportAddr, Con
 import webrtc.ice.candidate : Candidate;
 import webrtc.sctp.association : Association, SctpRole = Role, AssocState;
 
+
 enum Perspective
 {
 	dialer, // ICE controlling, DTLS client, SCTP client
@@ -222,7 +223,9 @@ final class Connection
 
 		// ICE has selected a pair: DTLS may now run over it.
 		if (!dtlsDriving && ice.isConnected)
+		{
 			dtlsDriving = true;
+		}
 
 		if (dtlsDriving && !dtls.isHandshakeComplete)
 		{

@@ -49,6 +49,8 @@ struct ChannelEvent
 	ubyte[] data; // for message events (empty for an empty message)
 	string label; // for opened events (from a DCEP OPEN)
 	string protocol;
+	bool remote; // opened events: true if the PEER opened the channel (an inbound
+	// channel to accept), false if it is our own open being acknowledged
 }
 
 final class DataChannels
@@ -184,7 +186,8 @@ final class DataChannels
 			if (!alreadyOpen) // a duplicate OPEN on a live channel does not re-open it
 			{
 				if (openChannels.length + opening.length <= maxChannels)
-					evs ~= ChannelEvent(ChannelEventKind.opened, m.streamId, false, null, label, protocol);
+					evs ~= ChannelEvent(ChannelEventKind.opened, m.streamId, false, null,
+						label, protocol, true); // remote = the peer opened this channel
 			}
 		}
 		else if (m.data[0] == dcepAck)

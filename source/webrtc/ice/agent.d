@@ -313,26 +313,13 @@ final class Agent
 			if (p.remoteAddr != from || p.localAddr != to)
 				continue;
 
-			// The nomination check was answered: the controlling side selects.
-			if (p.nominationSent && resp.transactionId == p.nomTxid)
-			{
-				if (role == Role.controlling)
-					select(p, now);
-				return;
-			}
-
 			if (p.state == PairState.inProgress && resp.transactionId == p.txid)
 			{
 				p.state = PairState.succeeded;
-				if (role == Role.controlling && !anyNominated)
-				{
-					// Nominate this pair: send a fresh check carrying USE-CANDIDATE;
-					// selection waits for its answer.
-					p.nominated = true;
-					p.nominationSent = true;
-					p.nomTxid = Message.randomTransactionId();
-					outbox ~= checkFor(p, true);
-				}
+				// Aggressive nomination: our checks already carried USE-CANDIDATE, so
+				// the first pair to succeed is the one we select — no second round.
+				if (role == Role.controlling)
+					select(p, now);
 				else if (role == Role.controlled && p.remoteNominated)
 					select(p, now);
 				return;
@@ -353,7 +340,7 @@ final class Agent
 				if (p.state == PairState.waiting)
 				{
 					startCheck(p, now);
-					outbox ~= checkFor(p, false);
+					outbox ~= checkFor(p);
 					startedAny = true;
 					lastCheckStart = now;
 					break;
@@ -372,7 +359,7 @@ final class Agent
 				{
 					p.tries++;
 					p.sentAt = now;
-					outbox ~= checkFor(p, false);
+					outbox ~= checkFor(p);
 				}
 			}
 
@@ -399,18 +386,19 @@ final class Agent
 		p.tries = 1;
 	}
 
-	// A connectivity check on a pair; with USE-CANDIDATE it is the nomination
-	// check and carries the nomination transaction id.
-	private OutboundStun checkFor(ref Pair p, bool useCandidate) @safe
+	// A connectivity check on a pair. Aggressive nomination (webrtc-direct's
+	// convention): the controlling side puts USE-CANDIDATE on every check, so the
+	// first pair to succeed is the selected one — no separate nomination round.
+	private OutboundStun checkFor(ref Pair p) @safe
 	{
 		Message m;
 		m.typ = bindingRequest;
-		m.transactionId = useCandidate ? p.nomTxid : p.txid;
+		m.transactionId = p.txid;
 		m.attributes ~= Attribute(attrUsername, (remote.ufrag ~ ":" ~ local.ufrag).representation.dup);
 		m.attributes ~= Attribute(attrPriority, be32(p.local.priority));
 		m.attributes ~= Attribute(role == Role.controlling ? attrIceControlling : attrIceControlled,
 			be64(tieBreaker));
-		if (useCandidate)
+		if (role == Role.controlling)
 			m.attributes ~= Attribute(attrUseCandidate, null);
 		m.addMessageIntegrity(remote.pwd.representation);
 		m.addFingerprint();
