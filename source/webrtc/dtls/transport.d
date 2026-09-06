@@ -26,7 +26,8 @@ import deimos.openssl.x509_vfy : X509_STORE_CTX;
 import webrtc.dtls.certificate : Certificate;
 
 // Missing from the deimos binding we use; DTLS_method negotiates DTLS ≥ 1.0 and
-// we floor it at 1.2 below.
+// we floor it at 1.2 below. (DTLSv1_handle_timeout is already provided by the
+// binding as an SSL_ctrl helper.)
 private extern (C) const(SSL_METHOD)* DTLS_method() @nogc nothrow;
 
 private enum int SSL_VERIFY_FAIL_IF_NO_PEER_CERT = 0x02;
@@ -148,6 +149,16 @@ final class DtlsTransport
 	bool isHandshakeComplete() const @safe pure nothrow @nogc
 	{
 		return handshakeDone;
+	}
+
+	/// Retransmit the last handshake flight if it has gone unanswered. This is the
+	/// one place the engine leans on OpenSSL's own clock rather than the caller's
+	/// `now` — DTLS's retransmit timer lives inside OpenSSL — so the caller drives
+	/// it from its periodic timeout and the records surface through takeOutbound.
+	void handleTimeout() @trusted
+	{
+		if (!handshakeDone)
+			DTLSv1_handle_timeout(ssl);
 	}
 
 	/// Whether the peer's close_notify has been observed.
