@@ -45,13 +45,18 @@ enum AssocState
 	cookieWait, // INIT sent, awaiting INIT ACK
 	cookieEchoed, // COOKIE ECHO sent, awaiting COOKIE ACK
 	established,
+	shutdownPending, // local close requested; draining outstanding data first
+	shutdownSent, // SHUTDOWN sent, awaiting SHUTDOWN ACK
+	shutdownReceived, // peer's SHUTDOWN seen; draining our data, then SHUTDOWN ACK
+	shutdownAckSent, // SHUTDOWN ACK sent, awaiting SHUTDOWN COMPLETE
 	failed,
 }
 
 // RFC 4960 §15 timers. RTO.Initial and the cap on INIT/COOKIE retransmits before
 // the association is abandoned.
 private enum long rtoInitialMs = 3000;
-private enum size_t maxInitRetransmits = 8;
+private enum size_t maxInitRetransmits = 8; // Max.Init.Retransmits
+private enum size_t assocMaxRetrans = 10; // Association.Max.Retrans (RFC 4960 §15)
 // A state cookie older than this is stale and refused (RFC 4960 §5.1.5 Valid.Cookie.Life).
 private enum long cookieLifeMs = 60_000;
 
@@ -140,6 +145,15 @@ final class Association
 	private long srtt;
 	private long rttvar;
 	private bool haveRtt;
+
+	// T2-shutdown (RFC 4960 §9.2): retransmits the in-flight SHUTDOWN / SHUTDOWN ACK.
+	private bool t2Running;
+	private long t2StartedAt;
+	private size_t t2Tries;
+	private ubyte[] t2Packet;
+
+	private size_t assocErrorCount; // consecutive retransmit failures (RFC 4960 §8.1)
+	private bool shutdownAckPending; // a coalesced SHUTDOWN ACK to (re)send
 
 	this(Role role, ushort localPort, ushort remotePort) @trusted
 	{
@@ -246,8 +260,20 @@ final class Association
 				case Kind.sack:
 					if (verifyTag(p)) onSack(c, now);
 					break;
+				case Kind.shutdown:
+					if (verifyTag(p)) onShutdown(c, now);
+					break;
+				case Kind.shutdownAck:
+					if (verifyTag(p)) onShutdownAck();
+					break;
+				case Kind.shutdownComplete:
+					if (verifyTag(p)) onShutdownComplete();
+					break;
+				case Kind.abort:
+					if (verifyTag(p)) onAbort();
+					break;
 				case Kind.other:
-					break; // teardown / RE-CONFIG handled by a later layer
+					break; // RE-CONFIG handled by a later layer
 				}
 			}
 		}
@@ -261,8 +287,9 @@ final class Association
 	void handleTimeout(long now) @safe
 	{
 		handleT1(now);
-		if (st == AssocState.established)
-			handleT3(now);
+		if (active)
+			handleT3(now); // retransmit and probe throughout a graceful close too
+		handleT2(now);
 	}
 
 	// T1: re-send the in-flight INIT/COOKIE-ECHO, failing after the retransmit cap.
@@ -298,6 +325,15 @@ final class Association
 
 		if (outstanding.length)
 		{
+			// Association-level failure after too many consecutive retransmits
+			// (RFC 4960 §8.1) — this is also the exit from a shutdown that a dead
+			// peer would otherwise wedge in a draining state.
+			if (++assocErrorCount > assocMaxRetrans)
+			{
+				st = AssocState.failed;
+				t3Running = false;
+				return;
+			}
 			ssthresh = cwnd / 2 > 4 * mtu ? cwnd / 2 : 4 * mtu;
 			cwnd = mtu;
 			rto = rto * 2 > rtoMaxMs ? rtoMaxMs : rto * 2; // exponential backoff
@@ -381,10 +417,69 @@ final class Association
 		return m;
 	}
 
+	// --- teardown ---------------------------------------------------------------------------
+
+	/// Begin a graceful close (RFC 4960 §9.2). Outstanding and queued DATA is sent
+	/// and acknowledged first; only then does SHUTDOWN go out. A no-op unless the
+	/// association is established.
+	void shutdown(long now) @safe
+	{
+		if (st != AssocState.established)
+			return;
+		if (dataDrained)
+			sendShutdown(now);
+		else
+			st = AssocState.shutdownPending;
+	}
+
+	/// Abort immediately (RFC 4960 §9.1): one ABORT, then closed. No handshake,
+	/// no retransmission, no waiting.
+	void abort() @safe
+	{
+		if (st == AssocState.closed || st == AssocState.failed)
+			return;
+		if (peerTag != 0)
+			outbox ~= sctpPacket(peerTag, [Chunk(ChunkType.abort, 0, null)]);
+		st = AssocState.closed;
+		clearT1();
+		clearT2();
+		t3Running = false;
+		// Nothing more may be sent after an ABORT: drop all pending output.
+		sendQueue = null;
+		sendQueuedBytes = 0;
+		outstanding = null;
+		outstandingBytes = 0;
+		sackPending = false;
+		shutdownAckPending = false;
+	}
+
+	private bool dataDrained() const @safe pure nothrow @nogc
+	{
+		return outstanding.length == 0 && sendQueue.length == 0;
+	}
+
+	private void sendShutdown(long now) @safe
+	{
+		// SHUTDOWN carries the cumulative TSN we have received.
+		ubyte[] v = new ubyte[4];
+		writeBe32(v[0 .. 4], cumAckTsn);
+		st = AssocState.shutdownSent;
+		armT2(sctpPacket(peerTag, [Chunk(ChunkType.shutdown, 0, v)]), now);
+	}
+
 	// --- outbound flush ---------------------------------------------------------------------
 
 	private void flush(long now) @safe
 	{
+		// Once closed or failed, nothing more goes on the wire (§9.1: nothing may
+		// follow an ABORT; a dead association sends no DATA/SACK).
+		if (!active)
+			return;
+		if (shutdownAckPending)
+		{
+			outbox ~= sctpPacket(peerTag, [Chunk(ChunkType.shutdownAck, 0, null)]);
+			shutdownAckPending = false;
+		}
 		if (sackPending)
 		{
 			outbox ~= sctpPacket(peerTag, [buildSack()]);
@@ -490,9 +585,18 @@ final class Association
 
 	// --- inbound DATA / SACK ----------------------------------------------------------------
 
+	// DATA and SACK are processed while the association is up and throughout a
+	// graceful close, so a shutdown can still drain and acknowledge in-flight data.
+	private bool active() const @safe pure nothrow @nogc
+	{
+		return st == AssocState.established || st == AssocState.shutdownPending
+			|| st == AssocState.shutdownSent || st == AssocState.shutdownReceived
+			|| st == AssocState.shutdownAckSent;
+	}
+
 	private void onData(ref Chunk c) @safe
 	{
-		if (st != AssocState.established)
+		if (!active)
 			return;
 		enforce(c.value.length >= dataHeaderLen, "sctp: short DATA chunk");
 		uint tsn = readBe32(c.value[0 .. 4]);
@@ -542,7 +646,7 @@ final class Association
 
 	private void onSack(ref Chunk c, long now) @safe
 	{
-		if (st != AssocState.established)
+		if (!active)
 			return;
 		enforce(c.value.length >= 12, "sctp: short SACK");
 		immutable cumAck = readBe32(c.value[0 .. 4]);
@@ -613,6 +717,8 @@ final class Association
 		}
 		outstanding = outstanding[0 .. kept];
 		outstandingBytes -= freed > outstandingBytes ? outstandingBytes : freed;
+		if (freed > 0)
+			assocErrorCount = 0; // forward progress resets the §8.1 failure counter
 
 		// Congestion control (RFC 4960 §7.2): slow start below ssthresh, else
 		// congestion avoidance; capped.
@@ -637,6 +743,114 @@ final class Association
 			t3Running = false;
 		else if (hadOutstanding && tsnLeq(earliestTsn, cumAck))
 			startT3Restart(now);
+
+		// A graceful close proceeds once all data has drained: the initiator sends
+		// SHUTDOWN, and a peer that already saw SHUTDOWN sends its SHUTDOWN ACK.
+		if (st == AssocState.shutdownPending && dataDrained)
+			sendShutdown(now);
+		else if (st == AssocState.shutdownReceived && dataDrained)
+			sendShutdownAck(now);
+	}
+
+	// --- teardown handlers ------------------------------------------------------------------
+
+	private void onShutdown(ref Chunk c, long now) @safe
+	{
+		// The SHUTDOWN's Cumulative TSN Ack acknowledges our sent data (RFC 4960
+		// §9.2): prune anything it covers before deciding whether we have drained.
+		if (c.value.length >= 4)
+		{
+			immutable cumAck = readBe32(c.value[0 .. 4]);
+			size_t kept;
+			foreach (ref o; outstanding)
+				if (!tsnLeq(o.tsn, cumAck))
+					outstanding[kept++] = o;
+				else
+					outstandingBytes -= o.payloadLen > outstandingBytes ? outstandingBytes : o.payloadLen;
+			outstanding = outstanding[0 .. kept];
+		}
+
+		if (st == AssocState.shutdownAckSent)
+		{
+			shutdownAckPending = true; // coalesced re-ack, not one per duplicate chunk
+			return;
+		}
+		if (st == AssocState.established || st == AssocState.shutdownPending
+			|| st == AssocState.shutdownSent || st == AssocState.shutdownReceived)
+		{
+			// Ack only once our own data has drained; otherwise keep sending and
+			// wait in SHUTDOWN-RECEIVED (the drain hook completes it).
+			if (dataDrained)
+				sendShutdownAck(now);
+			else
+				st = AssocState.shutdownReceived;
+		}
+	}
+
+	private void sendShutdownAck(long now) @safe
+	{
+		st = AssocState.shutdownAckSent;
+		armT2(sctpPacket(peerTag, [Chunk(ChunkType.shutdownAck, 0, null)]), now);
+	}
+
+	private void onShutdownAck() @safe
+	{
+		if (st != AssocState.shutdownSent && st != AssocState.shutdownAckSent)
+			return;
+		outbox ~= sctpPacket(peerTag, [Chunk(ChunkType.shutdownComplete, 0, null)]);
+		st = AssocState.closed;
+		clearT2();
+	}
+
+	private void onShutdownComplete() @safe
+	{
+		if (st == AssocState.shutdownAckSent || st == AssocState.shutdownSent)
+		{
+			st = AssocState.closed;
+			clearT2();
+		}
+	}
+
+	private void onAbort() @safe
+	{
+		st = AssocState.closed;
+		clearT1();
+		clearT2();
+		t3Running = false;
+	}
+
+	private void armT2(ubyte[] packet, long now) @safe
+	{
+		t2Packet = packet;
+		t2StartedAt = now;
+		t2Tries = 0;
+		t2Running = true;
+		outbox ~= packet.dup;
+	}
+
+	private void clearT2() @safe pure nothrow @nogc
+	{
+		t2Packet = null;
+		t2Running = false;
+		t2Tries = 0;
+	}
+
+	// T2-shutdown (RFC 4960 §9.2): retransmit SHUTDOWN / SHUTDOWN ACK, failing the
+	// association after the retransmit cap.
+	private void handleT2(long now) @safe
+	{
+		if (!t2Running || now - t2StartedAt < rto)
+			return;
+		if (t2Tries >= assocMaxRetrans)
+		{
+			st = AssocState.failed;
+			clearT2();
+			return;
+		}
+		t2Tries++;
+		t2StartedAt = now;
+		rto = rto * 2 > rtoMaxMs ? rtoMaxMs : rto * 2;
+		outbox ~= t2Packet.dup;
 	}
 
 	// --- reassembly and delivery ------------------------------------------------------------
@@ -1092,6 +1306,10 @@ private enum Kind
 	cookieAck,
 	data,
 	sack,
+	shutdown,
+	shutdownAck,
+	shutdownComplete,
+	abort,
 	other,
 }
 
@@ -1111,6 +1329,14 @@ private Kind chunkKind(ubyte typ) @safe pure nothrow @nogc
 		return Kind.data;
 	case ChunkType.sack:
 		return Kind.sack;
+	case ChunkType.shutdown:
+		return Kind.shutdown;
+	case ChunkType.shutdownAck:
+		return Kind.shutdownAck;
+	case ChunkType.shutdownComplete:
+		return Kind.shutdownComplete;
+	case ChunkType.abort:
+		return Kind.abort;
 	default:
 		return Kind.other;
 	}

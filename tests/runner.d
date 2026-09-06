@@ -9,5 +9,6 @@ int main(string[] args)
 		"tests.sctp.packet_test",
 		"tests.sctp.association_test",
 		"tests.sctp.transfer_test",
+		"tests.sctp.teardown_test",
 	);
 }
