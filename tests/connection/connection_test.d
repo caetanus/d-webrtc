@@ -93,6 +93,9 @@ unittest
 	ChannelEvent[] dEv, lEv;
 	pump(dialer, listener, 0, dEv, lEv, () => dialer.state == ConnState.failed);
 	dialer.state.should.equal(ConnState.failed);
+	// The reason names the certificate, so the caller surfaces why rather than
+	// letting the dial look merely slow.
+	dialer.failureReason().should.contain("certificate");
 }
 
 // Application data flows over the negotiated channel once connected.
@@ -177,6 +180,7 @@ unittest
 	ChannelEvent[] dEv, lEv;
 	pump(dialer, listener, 0, dEv, lEv, () => dialer.state == ConnState.failed);
 	dialer.state.should.equal(ConnState.failed);
+	dialer.failureReason().should.contain("certificate");
 }
 
 // The negotiated channel surfaces an opened event, so a poller sees id 0 come up.

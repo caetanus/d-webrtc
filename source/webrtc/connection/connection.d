@@ -72,6 +72,7 @@ final class Connection
 	private bool negotiatedOpened;
 	private bool closeRequested;
 	private ChannelEvent[] pendingEvents;
+	private string failReason;
 
 	this(Perspective p, Certificate cert, TransportAddr local, Credentials localCreds,
 		ulong iceTiebreaker) @safe
@@ -131,6 +132,14 @@ final class Connection
 	ConnState state() const @safe pure nothrow @nogc
 	{
 		return st;
+	}
+
+	/// Why the connection failed, valid once `state` is `failed` — the caller
+	/// surfaces it rather than letting a failed connection look like one that is
+	/// merely slow. Empty until something fails.
+	string failureReason() const @safe nothrow @nogc
+	{
+		return failReason;
 	}
 
 	DataChannels channels() @safe pure nothrow @nogc
@@ -214,6 +223,15 @@ final class Connection
 
 	// --- state machine ----------------------------------------------------------------------
 
+	// Move to failed and record why, keeping the first reason if several layers
+	// fail in the same step.
+	private void fail(string reason) @safe nothrow @nogc
+	{
+		st = ConnState.failed;
+		if (failReason.length == 0)
+			failReason = reason;
+	}
+
 	private void advance(long now) @safe
 	{
 		if (st == ConnState.closed || st == ConnState.failed)
@@ -221,7 +239,7 @@ final class Connection
 
 		if (ice.connectionState == ConnectionState.failed)
 		{
-			st = ConnState.failed;
+			fail("ICE failed to establish a path to the peer");
 			return;
 		}
 
@@ -246,9 +264,9 @@ final class Connection
 		{
 			try
 				dtls.handshake();
-			catch (Exception)
+			catch (Exception e)
 			{
-				st = ConnState.failed;
+				fail("DTLS handshake failed: " ~ e.msg);
 				return;
 			}
 		}
@@ -265,15 +283,25 @@ final class Connection
 			// is proven later over Noise), so it accepts the peer cert unpinned.
 			if (haveExpectedFp)
 			{
-				if (!dtls.verifyPeerFingerprint(expectedFp))
+				// verifyPeerFingerprint throws if the peer presented no certificate or
+				// its digest could not be taken — a failed pin, not an escape.
+				bool matched;
+				try
+					matched = dtls.verifyPeerFingerprint(expectedFp);
+				catch (Exception e)
 				{
-					st = ConnState.failed;
+					fail("certificate could not be verified: " ~ e.msg);
+					return;
+				}
+				if (!matched)
+				{
+					fail("certificate fingerprint does not match the expected certhash");
 					return;
 				}
 			}
 			else if (perspective == Perspective.dialer)
 			{
-				st = ConnState.failed;
+				fail("no expected certificate fingerprint for a webrtc-direct dial");
 				return;
 			}
 			sctpStarted = true;
@@ -300,7 +328,7 @@ final class Connection
 				dtls.write(pkt);
 
 			if (assoc.state == AssocState.failed)
-				st = ConnState.failed;
+				fail("SCTP association failed");
 		}
 
 		// Surface any channel events the association delivered.
