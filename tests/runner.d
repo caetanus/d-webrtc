@@ -7,5 +7,6 @@ int main(string[] args)
 		"tests.dtls.certificate_test",
 		"tests.dtls.transport_test",
 		"tests.sctp.packet_test",
+		"tests.sctp.association_test",
 	);
 }
