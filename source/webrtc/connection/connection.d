@@ -312,6 +312,8 @@ final class Connection
 		if (sctpStarted)
 		{
 			pumpSctpIn(now); // drain any app-data buffered behind the Finished record
+			if (st == ConnState.failed)
+				return; // pumpSctpIn hit a fatal DTLS error; do not drive SCTP further
 			assoc.handleTimeout(now);
 
 			if (assoc.isEstablished && !negotiatedOpened)
@@ -323,9 +325,19 @@ final class Connection
 					st = ConnState.connected;
 			}
 
-			// Move SCTP output out through DTLS.
+			// Move SCTP output out through DTLS. A write that cannot encrypt is fatal:
+			// the packet was already taken from the outbox, so losing it would corrupt
+			// the stream — fail the connection instead.
 			foreach (pkt; assoc.takeOutbound(now))
-				dtls.write(pkt);
+			{
+				try
+					dtls.write(pkt);
+				catch (Exception e)
+				{
+					fail("DTLS write failed: " ~ e.msg);
+					return;
+				}
+			}
 
 			if (assoc.state == AssocState.failed)
 				fail("SCTP association failed");
@@ -343,7 +355,14 @@ final class Connection
 			return;
 		while (true)
 		{
-			auto rec = dtls.read();
+			ubyte[] rec;
+			try
+				rec = dtls.read();
+			catch (Exception e)
+			{
+				fail("DTLS read failed: " ~ e.msg); // a broken DTLS layer fails the connection
+				return;
+			}
 			if (rec.length == 0)
 				break;
 			assoc.handleInbound(rec, now);

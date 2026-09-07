@@ -17,7 +17,7 @@ module webrtc.dtls.transport;
 import std.exception : enforce;
 
 import deimos.openssl.bio;
-import deimos.openssl.err : ERR_get_error, ERR_error_string_n;
+import deimos.openssl.err : ERR_get_error, ERR_error_string_n, ERR_clear_error;
 import deimos.openssl.evp : EVP_sha256;
 import deimos.openssl.srtp : SSL_CTX_set_tlsext_use_srtp;
 import deimos.openssl.ssl;
@@ -181,13 +181,16 @@ final class DtlsTransport
 		enforce(handshakeDone, "dtls: write before handshake completed");
 		if (data.length == 0)
 			return;
+		ERR_clear_error(); // so SSL_get_error reads THIS call's error, not a stale one
 		immutable n = SSL_write(ssl, data.ptr, cast(int) data.length);
 		if (n <= 0)
 		{
+			// A memory BIO never blocks on write, so WANT_READ/WANT_WRITE here does
+			// not mean "retry later" — the record was not written. The caller has
+			// already taken this packet from the SCTP outbox, so dropping it silently
+			// would corrupt the stream; treat any non-write as a failure.
 			immutable e = SSL_get_error(ssl, n);
-			if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
-				return; // a mem BIO does not block; treat as nothing written
-			throw new Exception("dtls: write failed (SSL_get_error " ~ errName(e) ~ ")");
+			throw new Exception("dtls: write failed (SSL_get_error " ~ errName(e) ~ "): " ~ errQueue());
 		}
 	}
 
@@ -196,13 +199,22 @@ final class DtlsTransport
 	ubyte[] read() @trusted
 	{
 		ubyte[16384] buf;
+		ERR_clear_error(); // so SSL_get_error reads THIS call's error, not a stale one
 		immutable n = SSL_read(ssl, buf.ptr, cast(int) buf.length);
 		if (n > 0)
 			return buf[0 .. n].dup;
 		immutable e = SSL_get_error(ssl, n);
+		if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+			return null; // no application record ready yet
 		if (e == SSL_ERROR_ZERO_RETURN)
-			peerClosedFlag = true;
-		return null;
+		{
+			peerClosedFlag = true; // the peer sent close_notify
+			return null;
+		}
+		// SSL_ERROR_SSL / SSL_ERROR_SYSCALL: a fatal DTLS error. Throw rather than
+		// return null, so a broken connection is not mistaken for an idle one that
+		// simply has no data yet.
+		throw new Exception("dtls: read failed (SSL_get_error " ~ errName(e) ~ "): " ~ errQueue());
 	}
 
 	/// Begin an orderly close: emit a close_notify. The caller drains it with
