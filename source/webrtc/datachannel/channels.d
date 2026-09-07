@@ -59,6 +59,7 @@ final class DataChannels
 	private Role role;
 	private bool[ushort] openChannels; // established channels
 	private bool[ushort] opening; // DCEP OPEN sent by us, awaiting ACK
+	private bool[ushort] pendingAcks; // OPENs we must ACK but could not queue yet (send buffer full)
 	private ushort nextEven = 2; // the DTLS client uses even ids; 0 is the negotiated channel
 	private ushort nextOdd = 1; // the DTLS server uses odd ids
 
@@ -133,6 +134,7 @@ final class DataChannels
 		if (id in openChannels)
 			openChannels.remove(id);
 		opening.remove(id);
+		pendingAcks.remove(id); // a channel we are closing needs no ACK
 		assoc.resetStream(id, now);
 	}
 
@@ -146,6 +148,7 @@ final class DataChannels
 	/// and a peer's stream reset becomes a closed event.
 	ChannelEvent[] events() @safe
 	{
+		flushPendingAcks(); // retry any ACK the send buffer was too full to take earlier
 		ChannelEvent[] evs;
 		foreach (m; assoc.receive())
 		{
@@ -161,6 +164,7 @@ final class DataChannels
 			immutable known = (s in openChannels) !is null || (s in opening) !is null;
 			openChannels.remove(s);
 			opening.remove(s);
+			pendingAcks.remove(s); // a reset channel needs no ACK
 			if (known)
 				evs ~= ChannelEvent(ChannelEventKind.closed, s);
 		}
@@ -181,14 +185,16 @@ final class DataChannels
 			if (!decodeOpen(m.data, label, protocol))
 				return; // malformed: drop
 			immutable alreadyOpen = (m.streamId in openChannels) !is null;
+			// Bound concurrent channels (Law 1) at the point of admission: refuse a
+			// NEW inbound channel past the ceiling instead of recording and ACKing it.
+			// Data on a stream we never opened is dropped anyway.
+			if (!alreadyOpen && openChannels.length + opening.length >= maxChannels)
+				return;
 			openChannels[m.streamId] = true;
-			ackOpen(m.streamId); // (re-)acknowledge; a lost ACK must be answerable
+			ackOpen(m.streamId); // (re-)acknowledge; SCTP delivered the OPEN once
 			if (!alreadyOpen) // a duplicate OPEN on a live channel does not re-open it
-			{
-				if (openChannels.length + opening.length <= maxChannels)
-					evs ~= ChannelEvent(ChannelEventKind.opened, m.streamId, false, null,
-						label, protocol, true); // remote = the peer opened this channel
-			}
+				evs ~= ChannelEvent(ChannelEventKind.opened, m.streamId, false, null,
+					label, protocol, true); // remote = the peer opened this channel
 		}
 		else if (m.data[0] == dcepAck)
 		{
@@ -202,14 +208,31 @@ final class DataChannels
 	}
 
 	// Acknowledge an OPEN. The ACK must never turn an inbound packet into a thrown
-	// exception (Law 4): if the send buffer is full, drop it — the peer's DCEP
-	// retransmit will prompt another ACK.
+	// exception (Law 4), but SCTP has already delivered the OPEN and will not
+	// re-deliver it, so a dropped ACK would strand the channel. If the send buffer
+	// is full, remember the id and retry from events() until it goes through.
 	private void ackOpen(ushort id) @safe
 	{
 		try
 			assoc.send(id, ppidDcep, [dcepAck]);
 		catch (Exception)
+			pendingAcks[id] = true;
+	}
+
+	// Retry the ACKs the send buffer could not take earlier, dropping each one that
+	// now goes through. Driven from events(), so it needs no timer of its own.
+	private void flushPendingAcks() @safe
+	{
+		foreach (id; pendingAcks.keys)
 		{
+			try
+			{
+				assoc.send(id, ppidDcep, [dcepAck]);
+				pendingAcks.remove(id);
+			}
+			catch (Exception)
+			{
+			} // still full; try again on the next drive
 		}
 	}
 
