@@ -106,6 +106,18 @@ final class Connection
 		ice.setRemoteCredentials(c);
 	}
 
+	/// Probe `server` for our server-reflexive candidate (see Agent.addStunServer).
+	void addStunServer(TransportAddr server) @safe
+	{
+		ice.addStunServer(server);
+	}
+
+	/// The local ICE candidates gathered so far (host + server-reflexive).
+	const(Candidate)[] gatheredCandidates() const @safe pure nothrow
+	{
+		return ice.gatheredCandidates();
+	}
+
 	/// Pin the peer to this SHA-256 certificate fingerprint (the certhash from the
 	/// remote multiaddr). Without it the DTLS peer is accepted unpinned.
 	void setExpectedFingerprint(ubyte[32] fp) @safe
