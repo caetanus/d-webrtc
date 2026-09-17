@@ -29,10 +29,12 @@
  */
 module webrtc.ice.agent;
 
-import std.algorithm.searching : canFind;
+import std.algorithm.searching : canFind, find;
 import std.algorithm.sorting : sort;
-import std.array : split;
+import std.array : split, join;
 import std.conv : to;
+import std.format : format;
+import std.range : empty, front;
 import std.string : representation;
 
 import webrtc.ice.candidate : Candidate, CandidateType;
@@ -96,6 +98,16 @@ private enum PairState
 	failed,
 }
 
+// One outstanding STUN-server probe for our server-reflexive mapping.
+private struct SrflxProbe
+{
+	TransactionId txid;
+	TransportAddr server;
+	long sentAt; /// ms; when the current try went out
+	size_t tries;
+	bool done; /// answered, or gave up after maxTries
+}
+
 private struct Pair
 {
 	Candidate local;
@@ -144,6 +156,11 @@ final class Agent
 	private long lastConsentAt; /// ms; when consent was last confirmed by a response
 	private OutboundStun[] outbox;
 
+	// Server-reflexive gathering: probe configured STUN servers for our own public
+	// mapping (XOR-MAPPED-ADDRESS), so a two-NAT punch has a reflexive candidate.
+	private TransportAddr[] stunServers;
+	private SrflxProbe[] srflxProbes;
+
 	this(Role role, Credentials local, ulong tieBreaker) @safe pure nothrow
 	{
 		this.role = role;
@@ -157,6 +174,27 @@ final class Agent
 	{
 		remote = c;
 		haveRemote = true;
+	}
+
+	/// Add a STUN server to probe for our server-reflexive candidate. The transport
+	/// pumps the resulting Binding request out the same UDP socket the ICE uses, so
+	/// the mapping learned is the one the peer will punch to.
+	void addStunServer(TransportAddr server) @safe
+	{
+		if (stunServers.canFind(server))
+			return;
+		stunServers ~= server;
+		SrflxProbe p;
+		p.server = server;
+		p.txid = Message.randomTransactionId();
+		srflxProbes ~= p;
+	}
+
+	/// The local candidates gathered so far (host + any server-reflexive learned
+	/// from a STUN server), for the signaling layer to advertise to the remote.
+	const(Candidate)[] gatheredCandidates() const @safe pure nothrow
+	{
+		return localCandidates;
 	}
 
 	void addLocalCandidate(Candidate c) @safe pure
@@ -297,6 +335,20 @@ final class Agent
 
 	private void handleResponse(ref Message resp, TransportAddr from, TransportAddr to, long now) @safe
 	{
+		// A STUN-server answer to our srflx probe: unauthenticated (public STUN),
+		// matched by transaction id. Learn our public mapping as a srflx candidate.
+		foreach (ref sp; srflxProbes)
+			if (!sp.done && resp.transactionId == sp.txid)
+			{
+				sp.done = true;
+				if (resp.has(attrXorMappedAddress))
+				{
+					auto a = XorMappedAddress.decode(resp.get(attrXorMappedAddress), resp.transactionId);
+					addLocalCandidate(Candidate.serverReflexive(bytesToIp(a.ip), a.port, a.ip.length == 16));
+				}
+				return;
+			}
+
 		if (!resp.checkMessageIntegrity(remote.pwd.representation))
 			return;
 
@@ -329,8 +381,39 @@ final class Agent
 
 	// --- scheduler --------------------------------------------------------------------------
 
+	// Emit (or retransmit, on the same RTO schedule as checks) a Binding request to
+	// each STUN server whose reflexive address we haven't learned, out our host
+	// candidate's socket. Runs independently of the remote (we gather up front).
+	private void gatherSrflx(long now) @safe
+	{
+		if (srflxProbes.length == 0)
+			return;
+		auto host = localCandidates.find!(c => c.typ == CandidateType.host);
+		if (host.empty)
+			return; // no local socket to probe from yet
+		immutable src = TransportAddr(host.front.address, host.front.port);
+		foreach (ref sp; srflxProbes)
+		{
+			if (sp.done || (sp.tries > 0 && now - sp.sentAt < rtoMs))
+				continue;
+			if (sp.tries >= maxTries)
+			{
+				sp.done = true; // gave up on this server
+				continue;
+			}
+			Message m;
+			m.typ = bindingRequest;
+			m.transactionId = sp.txid;
+			m.addFingerprint();
+			outbox ~= OutboundStun(src, sp.server, m.encode);
+			sp.tries++;
+			sp.sentAt = now;
+		}
+	}
+
 	private void schedule(long now) @safe
 	{
+		gatherSrflx(now); // gather our public mapping, independent of the remote
 		if (!haveRemote || localCandidates.length == 0)
 			return;
 
@@ -510,4 +593,14 @@ private ubyte[] ipToBytes(string ip) @safe pure
 	foreach (part; ip.split('.'))
 		v ~= part.to!ubyte;
 	return v;
+}
+
+private string bytesToIp(const(ubyte)[] b) @safe pure
+{
+	if (b.length == 4)
+		return format("%d.%d.%d.%d", b[0], b[1], b[2], b[3]);
+	string[] parts;
+	for (size_t i = 0; i + 1 < b.length; i += 2)
+		parts ~= format("%x", (b[i] << 8) | b[i + 1]);
+	return parts.join(":");
 }

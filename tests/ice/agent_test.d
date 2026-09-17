@@ -239,3 +239,39 @@ unittest
 	al.port.should.equal(aAddr.port);
 	ar.port.should.equal(bAddr.port);
 }
+
+@("ice: server-reflexive gathering — a STUN answer becomes a srflx candidate")
+@safe unittest
+{
+	import webrtc.ice.candidate : CandidateType;
+	import std.algorithm.searching : find;
+	import std.range : empty, front;
+
+	enum stun = TransportAddr("198.51.100.10", 3478);
+	enum localHost = TransportAddr("192.168.1.10", 50000);
+
+	auto a = new Agent(Role.controlling, aCreds, 0x2222_2222_2222_2222);
+	a.addLocalCandidate(Candidate.host(localHost.ip, localHost.port));
+	a.addStunServer(stun);
+
+	// The agent emits a Binding request to the STUN server, out its host socket.
+	auto probe = a.gatherOutbound(0).find!(o => o.dst == stun);
+	(!probe.empty).should.equal(true);
+	auto req = Message.decode(probe.front.data);
+	req.typ.should.equal(bindingRequest);
+
+	// The STUN server answers with our public mapping (XOR-MAPPED-ADDRESS).
+	Message resp;
+	resp.typ = bindingSuccess;
+	resp.transactionId = req.transactionId;
+	resp.attributes ~= Attribute(attrXorMappedAddress,
+		XorMappedAddress([cast(ubyte) 181, 233, 106, 5], cast(ushort) 46946).encode(req.transactionId));
+	resp.addFingerprint();
+	a.handleInbound(resp.encode, stun, localHost, 20);
+
+	// The agent learned a server-reflexive candidate at that public address.
+	auto srflx = a.gatheredCandidates.find!(c => c.typ == CandidateType.serverReflexive);
+	(!srflx.empty).should.equal(true);
+	srflx.front.address.should.equal("181.233.106.5");
+	srflx.front.port.should.equal(cast(ushort) 46946);
+}

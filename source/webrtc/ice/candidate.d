@@ -72,6 +72,20 @@ struct Candidate
 		c.foundation = computeFoundation(CandidateType.peerReflexive, address);
 		return c;
 	}
+
+	/// A server-reflexive candidate: our public mapping as a STUN server reported
+	/// it (XOR-MAPPED-ADDRESS). This is the candidate a two-NAT hole punch trades.
+	static Candidate serverReflexive(string address, ushort port, bool ipv6) @safe pure
+	{
+		Candidate c;
+		c.typ = CandidateType.serverReflexive;
+		c.address = address;
+		c.port = port;
+		c.ipv6 = ipv6;
+		c.priority = computePriority(CandidateType.serverReflexive, 65535, c.component);
+		c.foundation = computeFoundation(CandidateType.serverReflexive, address);
+		return c;
+	}
 }
 
 /// RFC 8445 §5.1.2.1: priority = 2^24·typePref + 2^8·localPref + (256 − component).
