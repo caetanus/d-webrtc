@@ -411,6 +411,19 @@ final class Association
 
 	// --- data transfer API ------------------------------------------------------------------
 
+	/// Whether `n` more application bytes fit the send buffer now (send refuses
+	/// past it). A writer that wants to block, rather than fail, waits for this.
+	/// Whenever send() would refuse no matter how the buffer drains — the
+	/// association is no longer established (a peer ABORT, a shutdown), or the
+	/// message is past the reassembly bound — the answer is true, so such a writer
+	/// gets send()'s error rather than a wait that never ends.
+	bool canSend(size_t n) const @safe pure nothrow
+	{
+		if (st != AssocState.established || n > maxMessage)
+			return true;
+		return sendQueuedBytes + n <= sendBufferCap;
+	}
+
 	/// Queue an application message for reliable delivery on a stream. Ordered by
 	/// default; `unordered` skips the per-stream sequence. The message is
 	/// fragmented into DATA chunks; sending is window-limited and happens on the

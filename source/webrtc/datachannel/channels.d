@@ -128,6 +128,13 @@ final class DataChannels
 			assoc.send(id, binary ? ppidBinary : ppidString, data);
 	}
 
+	/// Whether a message of `n` bytes fits the association's send buffer now. An
+	/// empty message still takes its one padding byte (see send).
+	bool canSend(size_t n) const @safe pure nothrow
+	{
+		return assoc.canSend(n == 0 ? 1 : n);
+	}
+
 	/// Close a channel by resetting its SCTP stream.
 	void close(ushort id, long now) @safe
 	{

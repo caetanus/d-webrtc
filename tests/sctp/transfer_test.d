@@ -466,6 +466,82 @@ unittest
 	client.state.should.equal(AssocState.established); // refusal, not death
 }
 
+// canSend is the send buffer's answer ahead of time, so a writer can block rather
+// than be refused: it says no exactly when send would refuse, and yes again once
+// the peer's SACKs let the queue drain onto the wire.
+@("sctp: canSend predicts the send buffer and reopens as the peer acknowledges")
+unittest
+{
+	auto client = new Association(Role.client, 5000, 5000);
+	auto server = new Association(Role.server, 5000, 5000);
+	establish(client, server);
+
+	auto msg = new ubyte[16 * 1024];
+	size_t queued;
+	while (client.canSend(msg.length))
+	{
+		client.send(0, 53, msg);
+		queued++;
+	}
+	queued.should.equal(64); // 1 MiB of 16 KiB messages
+	bool refused;
+	try
+		client.send(0, 53, msg);
+	catch (Exception)
+		refused = true;
+	refused.should.equal(true); // canSend said no, and send agrees
+
+	// The peer reads and acknowledges: the queue drains and there is room again.
+	size_t delivered;
+	foreach (_; 0 .. 400)
+	{
+		ferry(client, server, 1);
+		delivered += server.receive().length;
+		if (client.canSend(msg.length))
+			break;
+	}
+	client.canSend(msg.length).should.equal(true);
+	delivered.should.be.greaterThan(0);
+
+	// A message past the reassembly bound never fits; canSend does not make a
+	// writer wait for it — send refuses it outright.
+	client.canSend(512 * 1024).should.equal(true);
+	bool tooBig;
+	try
+		client.send(0, 53, new ubyte[512 * 1024]);
+	catch (Exception)
+		tooBig = true;
+	tooBig.should.equal(true);
+}
+
+// A writer blocked on a full buffer must not wait forever once the association
+// is gone: after a peer ABORT the queue never drains, so canSend turns true and
+// send reports the dead association.
+@("sctp: canSend releases a blocked writer when the peer aborts")
+unittest
+{
+	auto client = new Association(Role.client, 5000, 5000);
+	auto server = new Association(Role.server, 5000, 5000);
+	establish(client, server);
+
+	auto msg = new ubyte[16 * 1024];
+	while (client.canSend(msg.length))
+		client.send(0, 53, msg);
+	client.canSend(msg.length).should.equal(false);
+
+	server.abort();
+	foreach (d; server.takeOutbound())
+		client.handleInbound(d, 0);
+	client.state.should.equal(AssocState.closed);
+	client.canSend(msg.length).should.equal(true);
+	bool refused;
+	try
+		client.send(0, 53, msg);
+	catch (Exception)
+		refused = true;
+	refused.should.equal(true);
+}
+
 // A DATA chunk lost in flight is recovered: with the first fragment dropped, the
 // message is still delivered whole once the T3 timer retransmits it.
 @("sctp: a dropped DATA chunk is recovered by retransmission")

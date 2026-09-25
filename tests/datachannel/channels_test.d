@@ -269,3 +269,26 @@ unittest
 	cd.close(0, 0);
 	cd.send(0, cast(ubyte[]) "x".dup, false).should.throwException!Exception;
 }
+
+// An empty message still costs its one padding byte, so canSend(0) must say no
+// when the association's send buffer is exactly full, as send would refuse it.
+@("datachannel: canSend counts an empty message's padding byte")
+unittest
+{
+	auto ca = new Association(Role.client, 5000, 5000);
+	auto sa = new Association(Role.server, 5000, 5000);
+	establish(ca, sa);
+	auto cd = new DataChannels(ca, Role.client);
+	cd.openNegotiated(0);
+
+	auto msg = new ubyte[16 * 1024];
+	while (cd.canSend(msg.length))
+		cd.send(0, msg, true); // nothing is ferried: exactly 1 MiB queues
+	cd.canSend(0).should.equal(false);
+	bool refused;
+	try
+		cd.send(0, null, true);
+	catch (Exception)
+		refused = true;
+	refused.should.equal(true);
+}
