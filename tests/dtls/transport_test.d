@@ -86,3 +86,34 @@ unittest
 	server.read(); // consumes the close_notify
 	server.peerClosed().should.equal(true);
 }
+
+// Every record goes out as a datagram of its own, whole. A stream memory BIO ran
+// records together and takeOutbound's fixed-size reads cut one across two
+// datagrams: the peer dropped both halves, a loss every few packets of a burst.
+@("dtls: a burst of records leaves as one whole datagram each")
+unittest
+{
+	auto client = new DtlsTransport(DtlsRole.client, new Certificate);
+	auto server = new DtlsTransport(DtlsRole.server, new Certificate);
+	driveHandshake(client, server);
+	client.isHandshakeComplete().should.equal(true);
+
+	enum n = 10;
+	foreach (i; 0 .. n)
+	{
+		auto rec = new ubyte[1100];
+		rec[] = cast(ubyte) i;
+		client.write(rec);
+	}
+	auto dgs = client.takeOutbound();
+	dgs.length.should.equal(n); // one datagram per record, none split or merged
+
+	// Fed one datagram at a time — as a socket delivers them — each reads back whole.
+	foreach (i, dg; dgs)
+	{
+		server.feedInbound(dg);
+		auto got = server.read();
+		got.length.should.equal(1100);
+		got[0].should.equal(cast(ubyte) i);
+	}
+}

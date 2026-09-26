@@ -337,6 +337,11 @@ final class Connection
 					st = ConnState.connected;
 			}
 
+			// Hand the application what arrived BEFORE the SACKs are built: draining
+			// the receive buffer is what reopens the window they advertise.
+			if (negotiatedOpened)
+				pendingEvents ~= dc.events();
+
 			// Move SCTP output out through DTLS. A write that cannot encrypt is fatal:
 			// the packet was already taken from the outbox, so losing it would corrupt
 			// the stream — fail the connection instead.
@@ -355,7 +360,7 @@ final class Connection
 				fail("SCTP association failed");
 		}
 
-		// Surface any channel events the association delivered.
+		// Surface any channel events the association delivered since.
 		if (negotiatedOpened)
 			pendingEvents ~= dc.events();
 	}

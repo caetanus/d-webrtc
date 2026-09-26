@@ -588,9 +588,9 @@ unittest
 	got.should.equal(payload); // and the message still arrived whole
 }
 
-// Four SACKs reporting the same chunk missing trigger a fast retransmit before
-// the T3 timer would fire.
-@("sctp: four missing reports trigger a fast retransmit")
+// Three SACKs that each newly acknowledge a later chunk report the same chunk
+// missing three times — a fast retransmit before the T3 timer would fire.
+@("sctp: three missing reports trigger a fast retransmit")
 unittest
 {
 	auto client = new Association(Role.client, 5000, 5000);
@@ -601,24 +601,9 @@ unittest
 	auto sent = client.takeOutbound(0);
 	immutable firstTsn = readU32(Packet.decode(sent[0]).chunks[0].value[0 .. 4]);
 
-	// A SACK that gap-acks X+1..X+4 but never X (cumulative stays X-1).
-	ubyte[] sackVal = new ubyte[16];
-	writeU32(sackVal[0 .. 4], firstTsn - 1);
-	writeU32(sackVal[4 .. 8], 200_000);
-	writeU16(sackVal[8 .. 10], 1);
-	writeU16(sackVal[10 .. 12], 0);
-	writeU16(sackVal[12 .. 14], 2); // start offset (X+1)
-	writeU16(sackVal[14 .. 16], 5); // end offset (X+4)
-
-	Packet sack;
-	sack.srcPort = 5000;
-	sack.dstPort = 5000;
-	sack.verificationTag = client.localInitiateTag;
-	sack.chunks ~= Chunk(ChunkType.sack, 0, sackVal);
-
-	// Four identical SACKs: the fourth reaches the missing-report threshold.
-	foreach (i; 0 .. 4)
-		client.handleInbound(sack.encode, 100 + i);
+	// SACKs gap-acking X+1, then X+1..X+2, then X+1..X+3 — never X.
+	foreach (i; 0 .. 3)
+		client.handleInbound(gapSack(client, firstTsn - 1, 2, cast(ushort)(2 + i)), 100 + i);
 	auto outs = client.takeOutbound(200);
 
 	// The missing chunk X is retransmitted. Other chunks freed by the ack may also
@@ -631,6 +616,49 @@ unittest
 			sawRetransmit = true;
 	}
 	sawRetransmit.should.equal(true);
+}
+
+// A repeated SACK carries no new evidence of loss (RFC 4960 §7.2.4, HTNA): the
+// same gap reported again and again must not fast-retransmit or cut the window.
+@("sctp: repeated identical SACKs do not trigger a fast retransmit")
+unittest
+{
+	auto client = new Association(Role.client, 5000, 5000);
+	auto server = new Association(Role.server, 5000, 5000);
+	establish(client, server);
+
+	client.send(0, 55, new ubyte[5000]);
+	auto sent = client.takeOutbound(0);
+	immutable firstTsn = readU32(Packet.decode(sent[0]).chunks[0].value[0 .. 4]);
+	immutable cwnd0 = client.congestionWindow;
+
+	foreach (i; 0 .. 6)
+		client.handleInbound(gapSack(client, firstTsn - 1, 2, 5), 100 + i);
+	foreach (d; client.takeOutbound(200))
+	{
+		auto pk = Packet.decode(d);
+		if (pk.chunks[0].typ == ChunkType.data)
+			(readU32(pk.chunks[0].value[0 .. 4]) == firstTsn).should.equal(false);
+	}
+	(client.congestionWindow >= cwnd0).should.equal(true); // no loss was inferred
+}
+
+// A SACK for `client`: cumulative `cum`, one gap block [start, end] (offsets).
+private ubyte[] gapSack(Association client, uint cum, ushort start, ushort end)
+{
+	ubyte[] sackVal = new ubyte[16];
+	writeU32(sackVal[0 .. 4], cum);
+	writeU32(sackVal[4 .. 8], 200_000);
+	writeU16(sackVal[8 .. 10], 1);
+	writeU16(sackVal[10 .. 12], 0);
+	writeU16(sackVal[12 .. 14], start);
+	writeU16(sackVal[14 .. 16], end);
+	Packet sack;
+	sack.srcPort = 5000;
+	sack.dstPort = 5000;
+	sack.verificationTag = client.localInitiateTag;
+	sack.chunks ~= Chunk(ChunkType.sack, 0, sackVal);
+	return sack.encode;
 }
 
 // With the peer's window shut and data queued, a zero-window probe is sent when

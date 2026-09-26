@@ -30,6 +30,8 @@ import webrtc.dtls.certificate : Certificate;
 // we floor it at 1.2 below. (DTLSv1_handle_timeout is already provided by the
 // binding as an SSL_ctrl helper.)
 private extern (C) const(SSL_METHOD)* DTLS_method() @nogc nothrow;
+// A memory BIO that keeps datagram boundaries (OpenSSL ≥ 3.2), absent from the binding.
+private extern (C) const(BIO_METHOD)* BIO_s_dgram_mem() @nogc nothrow;
 
 private enum int SSL_VERIFY_FAIL_IF_NO_PEER_CERT = 0x02;
 private enum long dtls12Version = 0xFEFD; // DTLS1_2_VERSION
@@ -82,12 +84,17 @@ final class DtlsTransport
 
 		ssl = SSL_new(ctx);
 		enforce(ssl !is null, "dtls: SSL_new failed");
-		rbio = BIO_new(BIO_s_mem());
-		wbio = BIO_new(BIO_s_mem());
+		// Datagram memory BIOs, not stream ones: every record DTLS writes is one
+		// datagram out, and every datagram fed in is one read. A stream BIO ran
+		// the records together, and takeOutbound's fixed-size reads then cut one
+		// in two across datagrams — both halves dropped by the peer, a loss in
+		// every few packets of a burst, which on a real (delayed) link held SCTP's
+		// window at a handful of packets and its timers at their backoff.
+		rbio = BIO_new(cast(BIO_METHOD*) BIO_s_dgram_mem());
+		wbio = BIO_new(cast(BIO_METHOD*) BIO_s_dgram_mem());
 		enforce(rbio !is null && wbio !is null, "dtls: BIO_new failed");
-		// An empty memory BIO returns EOF by default, which DTLS reads as a dead
-		// connection; make an empty read signal "retry" (WANT_READ) instead.
-		BIO_set_mem_eof_return(rbio, -1);
+		// (an empty datagram memory BIO reads as "retry" — WANT_READ — by itself,
+		// not as EOF, which DTLS would take for a dead connection)
 		SSL_set_bio(ssl, rbio, wbio); // SSL now owns both BIOs
 
 		// A memory BIO has no MTU to query; tell DTLS not to try, and give it a
@@ -123,7 +130,7 @@ final class DtlsTransport
 	ubyte[][] takeOutbound() @trusted
 	{
 		ubyte[][] out_;
-		ubyte[4096] buf;
+		ubyte[65_536] buf; // one datagram per read, whole (a read never splits one)
 		while (true)
 		{
 			immutable n = BIO_read(wbio, buf.ptr, cast(int) buf.length);

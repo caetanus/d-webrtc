@@ -73,9 +73,9 @@ private enum size_t maxGapBlocks = 32; // keep a SACK inside one DTLS record
 private enum size_t maxDupTsns = 32;
 
 // RFC 4960 §6.3.1 retransmission timeout bounds and the fast-retransmit trigger.
-private enum long rtoMinMs = 1000;
+private enum long rtoMinMs = 200;
 private enum long rtoMaxMs = 60_000;
-private enum size_t fastRtxThreshold = 4; // missing reports before a fast retransmit
+private enum size_t fastRtxThreshold = 3; // missing reports before a fast retransmit (RFC 4960 §7.2.4)
 private enum size_t mtu = 1200; // congestion-window unit
 private enum long hbIntervalMs = 30_000; // HB.interval (RFC 4960 §8.3)
 private enum ushort paramHeartbeatInfo = 1; // Heartbeat Info parameter type
@@ -131,7 +131,7 @@ final class Association
 	private uint nextTsn; // next outbound DATA TSN
 	private ushort[ushort] nextSsn; // next outbound stream sequence number, per stream
 	private uint peerRwnd; // the peer's remaining advertised receive window
-	private size_t outstandingBytes; // unacked payload in flight
+	private size_t outstandingBytes; // unacked payload in flight (chunks marked for retransmission are not)
 	private Outstanding[] outstanding; // sent-but-unacked DATA, oldest TSN first
 	private Chunk[] sendQueue; // DATA chunks built but not yet sent (window-blocked)
 
@@ -145,8 +145,14 @@ final class Association
 	private bool sackPending;
 	private size_t cwnd = initialCwnd;
 	private size_t ssthresh = size_t.max; // slow-start threshold (RFC 4960 §7.2.1)
+	// Fast Recovery (RFC 4960 §7.2.4): after a fast retransmit the window is cut
+	// once, and not again for further losses in the same flight, until the
+	// cumulative ack passes the highest TSN outstanding when it began.
+	private bool inFastRecovery;
+	private uint fastRecoveryExit;
 	private size_t recvBuffered; // bytes held in the receive path (frags + held + inbox)
 	private size_t sendQueuedBytes; // app payload queued but not yet handed to the wire
+	private size_t lastAdvertisedRwnd = recvWindow; // a_rwnd in our last SACK
 
 	// T3-rtx (RFC 4960 §6.3): one retransmission timer, plus the RTT estimator.
 	private bool t3Running;
@@ -360,7 +366,7 @@ final class Association
 	// window shut and nothing in flight, a zero-window probe rides the same timer.
 	private void handleT3(long now) @safe
 	{
-		if (!t3Running && sendQueue.length && peerRwnd == 0 && outstanding.length == 0)
+		if (!t3Running && windowShut && outstanding.length == 0)
 		{
 			t3Running = true; // arm the persist/probe timer
 			t3StartedAt = now;
@@ -382,13 +388,26 @@ final class Association
 			ssthresh = cwnd / 2 > 4 * mtu ? cwnd / 2 : 4 * mtu;
 			cwnd = mtu;
 			rto = rto * 2 > rtoMaxMs ? rtoMaxMs : rto * 2; // exponential backoff
-			outstanding[0].sentAt = now;
-			outstanding[0].retransmitted = true;
-			outstanding[0].missing = 0;
-			outbox ~= sctpPacket(peerTag, [outstanding[0].chunk]);
+			inFastRecovery = false;
+			// RFC 4960 §6.3.3 E3 / §7.2.3: EVERY outstanding chunk is marked for
+			// retransmission and leaves the flight; flush() resends them, earliest
+			// first, as the (now one-MTU) window allows. Resending only the first
+			// left each further loss in the flight to a timer of its own, each at
+			// twice the RTO of the last — on a lossy link a lost chunk then waited
+			// 16, 32 s while nothing moved.
+			foreach (ref o; outstanding)
+			{
+				if (o.inFlight) // out of the flight: its receive-window credit returns
+					peerRwnd += cast(uint) o.payloadLen;
+				o.needRtx = true;
+				o.inFlight = false;
+				o.missing = 0;
+				o.retransmitted = true; // Karn: an ack of it can no longer be timed
+			}
+			outstandingBytes = 0;
 			t3StartedAt = now;
 		}
-		else if (sendQueue.length && peerRwnd == 0)
+		else if (windowShut)
 		{
 			rto = rto * 2 > rtoMaxMs ? rtoMaxMs : rto * 2;
 			forceOneChunk(now); // probe past the closed window to elicit a SACK
@@ -396,6 +415,14 @@ final class Association
 		}
 		else
 			t3Running = false;
+	}
+
+	// The peer's window cannot take the next queued chunk. Not only a zero window: a
+	// window smaller than one chunk stops the sender just the same, and with
+	// nothing in flight no SACK will come to reopen it — the probe must.
+	private bool windowShut() const @safe pure nothrow @nogc
+	{
+		return sendQueue.length && sendQueue[0].value.length - dataHeaderLen > peerRwnd;
 	}
 
 	/// Datagrams queued to send, each already a complete SCTP packet. Flushes a
@@ -472,6 +499,13 @@ final class Association
 		inbox = null;
 		foreach (ref msg; m)
 			recvBuffered -= msg.data.length > recvBuffered ? recvBuffered : msg.data.length;
+		// Window update (RFC 4960 §6.2): the peer last heard a window this much
+		// smaller. If it was small enough to hold the peer back, tell it at once
+		// — with nothing of its own in flight it would otherwise wait for its
+		// probe timer to find out.
+		if (m.length && active && lastAdvertisedRwnd < recvWindow / 2
+			&& receiveWindowBytes >= lastAdvertisedRwnd + 2 * mtu)
+			sackPending = true;
 		return m;
 	}
 
@@ -601,9 +635,37 @@ final class Association
 			outbox ~= sctpPacket(peerTag, [buildSack()]);
 			sackPending = false;
 		}
+		// Chunks marked for retransmission go first, earliest TSN first, as the
+		// congestion window allows (one always, when nothing is in flight).
+		bool rtxPending;
+		foreach (i, ref o; outstanding)
+		{
+			if (!o.needRtx)
+				continue;
+			if (outstandingBytes > 0 && outstandingBytes + o.payloadLen > cwnd)
+			{
+				rtxPending = true;
+				break;
+			}
+			o.needRtx = false;
+			o.inFlight = true;
+			o.retransmitted = true;
+			o.sentAt = now;
+			o.missing = 0;
+			outstandingBytes += o.payloadLen;
+			peerRwnd = o.payloadLen > peerRwnd ? 0 : cast(uint)(peerRwnd - o.payloadLen);
+			outbox ~= sctpPacket(peerTag, [o.chunk]);
+			// Resending the earliest outstanding chunk restarts T3 (§7.2.4 step 4 for a
+			// fast retransmission deferred to here; after a T3 expiry it has just
+			// restarted anyway), so its own recovery is not timed out at once.
+			if (i == 0)
+				startT3Restart(now);
+			else
+				startT3(now);
+		}
 		// Send queued DATA while the receive window and congestion window allow,
 		// one DATA chunk per packet so each stays inside a DTLS record.
-		while (sendQueue.length)
+		while (sendQueue.length && !rtxPending)
 		{
 			auto c = sendQueue[0];
 			immutable payload = c.value.length - dataHeaderLen;
@@ -612,7 +674,7 @@ final class Association
 			sendQueue = sendQueue[1 .. $];
 			sendQueuedBytes -= payload > sendQueuedBytes ? sendQueuedBytes : payload;
 			uint tsn = readBe32(c.value[0 .. 4]);
-			outstanding ~= Outstanding(tsn, c, payload, now, false, 0, false);
+			outstanding ~= Outstanding(tsn, c, payload, now, false, 0, false, false, true);
 			outstandingBytes += payload;
 			peerRwnd = payload > peerRwnd ? 0 : cast(uint)(peerRwnd - payload);
 			outbox ~= sctpPacket(peerTag, [c]);
@@ -630,34 +692,61 @@ final class Association
 		immutable payload = c.value.length - dataHeaderLen;
 		sendQueuedBytes -= payload > sendQueuedBytes ? sendQueuedBytes : payload;
 		immutable tsn = readBe32(c.value[0 .. 4]);
-		outstanding ~= Outstanding(tsn, c, payload, now, false, 0, false);
+		outstanding ~= Outstanding(tsn, c, payload, now, false, 0, false, false, true);
 		outstandingBytes += payload;
+		peerRwnd = payload > peerRwnd ? 0 : cast(uint)(peerRwnd - payload);
 		outbox ~= sctpPacket(peerTag, [c]);
 	}
 
-	// Fast retransmit (RFC 4960 §7.2.4): a chunk reported missing by four SACKs is
-	// resent at once, and the congestion window is halved once per event.
+	// Fast retransmit (RFC 4960 §7.2.4): a chunk reported missing by three SACKs is
+	// resent at once. Entering Fast Recovery cuts the congestion window once; more
+	// losses from the same flight are resent without cutting it again, until the
+	// cumulative ack passes the exit point — otherwise every loss in one window
+	// halved it anew and a lossy link sat at the minimum.
 	private void fastRetransmit(long now) @safe
 	{
-		bool adjusted;
-		foreach (ref o; outstanding)
+		// Only the chunk that ENTERS Fast Recovery goes at once, whatever the window
+		// (§7.2.4 step 3); every other loss — more holes in this SACK, or new ones
+		// later in the same recovery — leaves the flight and follows under the
+		// window, through flush().
+		bool mayBypass = !inFastRecovery;
+		foreach (i, ref o; outstanding)
 		{
-			if (o.missing < fastRtxThreshold || o.fastRetransmitted)
+			if (o.missing < fastRtxThreshold || o.fastRetransmitted || o.needRtx)
 				continue;
-			if (!adjusted)
+			if (!inFastRecovery)
 			{
 				ssthresh = cwnd / 2 > 4 * mtu ? cwnd / 2 : 4 * mtu;
 				cwnd = ssthresh;
-				adjusted = true;
+				inFastRecovery = true;
+				fastRecoveryExit = outstanding[$ - 1].tsn;
 			}
 			o.fastRetransmitted = true;
 			o.missing = 0;
-			o.sentAt = now;
 			o.retransmitted = true;
-			outbox ~= sctpPacket(peerTag, [o.chunk]);
+			if (mayBypass)
+			{
+				mayBypass = false;
+				o.sentAt = now; // still in flight: its window credit is already spent
+				outbox ~= sctpPacket(peerTag, [o.chunk]);
+				// A retransmission of the earliest chunk restarts T3 (step 4), so the
+				// timer does not fire on it before the recovery can be acknowledged.
+				if (i == 0)
+					startT3Restart(now);
+				else
+					startT3(now);
+			}
+			else
+			{
+				o.needRtx = true;
+				if (o.inFlight)
+				{
+					o.inFlight = false;
+					outstandingBytes -= o.payloadLen > outstandingBytes ? outstandingBytes : o.payloadLen;
+					peerRwnd += cast(uint) o.payloadLen; // debited again when flush resends it
+				}
+			}
 		}
-		if (adjusted)
-			startT3(now); // R1: keep the timer armed after a (re)transmission
 	}
 
 	// RFC 4960 §6.3.1 RTT estimator, clamped to [RTO.Min, RTO.Max].
@@ -792,12 +881,20 @@ final class Association
 
 		// Prune acked chunks, sample the RTT from one non-retransmitted ack, and
 		// count missing reports for the rest.
-		size_t freed;
+		size_t freed; // newly acked payload
+		size_t flightFreed; // ... of which was counted in flight
 		size_t kept;
 		bool sampled;
+		// Missing reports follow the Highest TSN Newly Acknowledged (RFC 4960
+		// §7.2.4 HTNA): only chunks below a TSN THIS SACK newly acked are reported
+		// missing, so a repeated SACK (it carries no new evidence) reports nothing.
+		bool anyNew, cumAdvanced;
+		uint htna;
 		foreach (ref o; outstanding)
 		{
 			bool acked = tsnLeq(o.tsn, cumAck);
+			if (acked)
+				cumAdvanced = true;
 			if (!acked)
 			{
 				size_t pos = 12;
@@ -815,7 +912,12 @@ final class Association
 			}
 			if (acked)
 			{
+				if (!anyNew || !tsnLeq(o.tsn, htna))
+					htna = o.tsn;
+				anyNew = true;
 				freed += o.payloadLen;
+				if (o.inFlight)
+					flightFreed += o.payloadLen;
 				if (!sampled && !o.retransmitted) // Karn: never sample a retransmit
 				{
 					updateRto(now - o.sentAt);
@@ -823,22 +925,25 @@ final class Association
 				}
 			}
 			else
-			{
-				// A still-unacked chunk that sits below a TSN this SACK acked has a
-				// missing report (it cannot equal an acked TSN).
-				if (tsnLeq(o.tsn, highestAcked))
-					o.missing++;
 				outstanding[kept++] = o;
-			}
 		}
 		outstanding = outstanding[0 .. kept];
-		outstandingBytes -= freed > outstandingBytes ? outstandingBytes : freed;
+		// In Fast Recovery a SACK that moves the cumulative point counts every hole
+		// below its highest gap-acked TSN (the HTNA exception).
+		immutable reportBelow = inFastRecovery && cumAdvanced ? highestAcked : htna;
+		if (anyNew || (inFastRecovery && cumAdvanced))
+			foreach (ref o; outstanding)
+				if (o.inFlight && tsnLeq(o.tsn, reportBelow) && o.tsn != reportBelow)
+					o.missing++;
+		outstandingBytes -= flightFreed > outstandingBytes ? outstandingBytes : flightFreed;
 		if (freed > 0)
 			assocErrorCount = 0; // forward progress resets the §8.1 failure counter
+		if (inFastRecovery && tsnLeq(fastRecoveryExit, cumAck))
+			inFastRecovery = false;
 
 		// Congestion control (RFC 4960 §7.2): slow start below ssthresh, else
-		// congestion avoidance; capped.
-		if (freed > 0)
+		// congestion avoidance; capped; and held while in Fast Recovery.
+		if (freed > 0 && !inFastRecovery)
 		{
 			if (cwnd <= ssthresh)
 				cwnd += freed < mtu ? freed : mtu;
@@ -881,7 +986,7 @@ final class Association
 			foreach (ref o; outstanding)
 				if (!tsnLeq(o.tsn, cumAck))
 					outstanding[kept++] = o;
-				else
+				else if (o.inFlight)
 					outstandingBytes -= o.payloadLen > outstandingBytes ? outstandingBytes : o.payloadLen;
 			outstanding = outstanding[0 .. kept];
 		}
@@ -1344,6 +1449,7 @@ final class Association
 
 		// Advertise the window remaining after what we are currently holding.
 		immutable aRwnd = recvWindow > recvBuffered ? recvWindow - recvBuffered : 0;
+		lastAdvertisedRwnd = aRwnd;
 		auto dups = dupTsns.length > maxDupTsns ? dupTsns[0 .. maxDupTsns] : dupTsns;
 
 		ubyte[] v = new ubyte[12];
@@ -1718,6 +1824,8 @@ private struct Outstanding
 	bool retransmitted; // never sample RTT from a retransmitted chunk (Karn's algorithm)
 	size_t missing; // gap-ack "missing report" count toward a fast retransmit
 	bool fastRetransmitted; // fast-retransmitted once already
+	bool needRtx; // marked for retransmission (a T3 expiry): flush resends it
+	bool inFlight; // counted in outstandingBytes (a chunk marked for retransmission is not)
 }
 
 // A received DATA fragment awaiting reassembly.
